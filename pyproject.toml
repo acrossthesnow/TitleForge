@@ -1,0 +1,51 @@
+[project]
+name = "titleforge"
+version = "0.1.0"
+description = "TitleForge — TMDB-backed media library paths with Plex-style Movies/ and Series/"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "TitleForge contributors" }]
+keywords = ["tmdb", "plex", "media", "rename", "cli", "movies", "tv"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+    "typer>=0.12",
+    "questionary>=2.0",
+    "textual>=0.47",
+]
+
+[project.optional-dependencies]
+dev = ["build>=1.0", "twine>=5.0"]
+
+[project.urls]
+# Replace with your canonical repository when publishing.
+Homepage = "https://github.com/titleforge/titleforge"
+Repository = "https://github.com/titleforge/titleforge"
+Issues = "https://github.com/titleforge/titleforge/issues"
+
+[project.scripts]
+titleforge = "titleforge.cli:run_cli"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

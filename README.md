@@ -9,7 +9,7 @@ Resolve movie and TV file paths with TMDB, then review moves in a terminal UI be
 Clone the repository, create a virtual environment, and install in editable mode:
 
 ```bash
-git clone https://github.com/titleforge/titleforge.git
+git clone https://github.com/acrossthesnow/titleforge.git
 cd titleforge
 python3.11 -m venv .venv
 source .venv/bin/activate

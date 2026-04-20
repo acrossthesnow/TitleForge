@@ -22,10 +22,24 @@ For wheel/sdist builds and `twine`, use **`pip install -e ".[dev]"`** once (see 
 
 ### Configuration
 
-Create `.env` in the repo root with either:
+TMDB credentials live in **`titleforge.conf`** (dotenv-style lines: `KEY=value`). Default location:
+
+| Platform | Path |
+|----------|------|
+| **Unix / macOS** | `~/.config/titleforge/titleforge.conf` |
+| **Unix / macOS** (when `XDG_CONFIG_HOME` is set) | `$XDG_CONFIG_HOME/titleforge/titleforge.conf` |
+| **Windows** | `%APPDATA%\TitleForge\titleforge.conf` (typically `C:\Users\<you>\AppData\Roaming\TitleForge\titleforge.conf`) |
+
+**First run:** if no credentials are found (neither in that file nor in the environment), TitleForge creates the config directory and **prompts** for your TMDB secret, then writes `TMDB_API_KEY=...` into `titleforge.conf`. You can paste either the **v3 API key** or the **v4 read access token (JWT)**; the client detects JWTs (`eyJ…`) and sends `Authorization: Bearer …` instead of using `api_key=` (which would return **401**).
+
+**Override:** a **`titleforge.conf`** in your **current working directory** overrides values from the user-level file when you run `titleforge` from that directory.
+
+**Environment (CI / scripts):** set **`TMDB_API_KEY`** or **`TMDB_READ_ACCESS_TOKEN`** in the shell instead of using a file; non-interactive runs require this if the config file is missing.
+
+In `titleforge.conf` (or env), use either:
 
 - **`TMDB_API_KEY`** — the short **API Key (v3)** from [TMDB Settings → API](https://www.themoviedb.org/settings/api), or  
-- **`TMDB_READ_ACCESS_TOKEN`** — the long **API Read Access Token** (JWT). You can also put that JWT in `TMDB_API_KEY`; the client detects JWTs (`eyJ…`) and sends `Authorization: Bearer …` instead of using `api_key=` (which would return **401**).
+- **`TMDB_READ_ACCESS_TOKEN`** — the long **API Read Access Token** (JWT). You can also put that JWT in `TMDB_API_KEY`.
 
 If you see **401 Unauthorized**, the credential is wrong for how it is sent: use the v3 key as `TMDB_API_KEY`, or the v4 JWT with Bearer (automatic when the value looks like a JWT).
 

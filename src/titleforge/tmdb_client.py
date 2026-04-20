@@ -13,7 +13,7 @@ _AUTH_HELP = (
     "  • Use the short **API Key (v3)** from https://www.themoviedb.org/settings/api as TMDB_API_KEY, or\n"
     "  • Use the long **API Read Access Token** (JWT) as TMDB_READ_ACCESS_TOKEN (or TMDB_API_KEY — "
     "the app sends JWTs as Authorization: Bearer, not as api_key=).\n"
-    "Do not paste the JWT into the v3 api_key field on the TMDB website; only in this app's .env."
+    "Do not paste the JWT into the v3 api_key field on the TMDB website; only in titleforge.conf."
 )
 
 

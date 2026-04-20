@@ -5,7 +5,7 @@ from pathlib import Path
 
 import typer
 
-from titleforge.config import get_tmdb_api_key, load_env
+from titleforge.config import ensure_tmdb_credentials_interactive, get_tmdb_api_key, load_dotenv_sources
 from titleforge.discover import discover_videos
 from titleforge.resolve import build_plan
 from titleforge.review_app import run_review
@@ -60,9 +60,8 @@ def main(
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
-    project_root = Path(__file__).resolve().parents[2]
-    load_env(project_root)
-    load_env(Path.cwd())
+    load_dotenv_sources()
+    ensure_tmdb_credentials_interactive()
     input_dir = input_dir.resolve()
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)

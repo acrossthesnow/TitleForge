@@ -1,4 +1,5 @@
 .env
+titleforge.conf
 .venv/
 __pycache__/
 *.py[cod]

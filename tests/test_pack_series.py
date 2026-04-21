@@ -9,8 +9,10 @@ from unittest.mock import MagicMock
 
 from titleforge.pack import (
     content_root,
+    entity_roots_under_input,
     first_segments_under,
     infer_season_from_path_ancestors,
+    input_entity_for_path,
     is_single_tv_pack,
 )
 from titleforge.plex_paths import build_season_extra_dest
@@ -31,7 +33,12 @@ class TestPackHeuristics(unittest.TestCase):
     def test_content_root(self) -> None:
         a = Path("/t/show/Season 1/a.mkv")
         b = Path("/t/show/Featurettes/Season 2/b.mkv")
-        self.assertEqual(content_root([a, b]), Path("/t/show"))
+        self.assertEqual(content_root([a, b], ceiling=Path("/t")), Path("/t/show"))
+
+    def test_content_root_never_above_ceiling(self) -> None:
+        a = Path("/t/torrents/show/Season 1/a.mkv")
+        b = Path("/t/torrents/show/Featurettes/b.mkv")
+        self.assertEqual(content_root([a, b], ceiling=Path("/t/torrents")), Path("/t/torrents/show"))
 
     def test_is_single_tv_pack_seasons_and_featurettes(self) -> None:
         root = Path("/t/show")
@@ -60,6 +67,18 @@ class TestPackHeuristics(unittest.TestCase):
             first_segments_under(root, files),
             {"Mad Men (2007)", "Avatar (2025)"},
         )
+
+    def test_entity_roots_under_input(self) -> None:
+        inp = Path("/in")
+        files = [
+            inp / "A" / "S01E01.mkv",
+            inp / "B" / "x.mkv",
+        ]
+        self.assertEqual(
+            entity_roots_under_input(files, inp),
+            [inp / "A", inp / "B"],
+        )
+        self.assertEqual(input_entity_for_path(inp, inp / "A" / "S01E01.mkv"), inp / "A")
 
 
 class TestInferSeason(unittest.TestCase):
@@ -95,8 +114,9 @@ class TestBuildSeasonExtraDest(unittest.TestCase):
 class TestPreparePackResolve(unittest.TestCase):
     def test_prepare_sets_pack_when_tmdb_returns_hit(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "Show Name (2010)"
-            f1 = root / "Season 1" / "Show Name (2010) - S01E01 - Pilot.mkv"
+            input_root = Path(td)
+            show = input_root / "Show Name (2010)"
+            f1 = show / "Season 1" / "Show Name (2010) - S01E01 - Pilot.mkv"
             f1.parent.mkdir(parents=True, exist_ok=True)
             f1.write_bytes(b"")
 
@@ -107,18 +127,17 @@ class TestPreparePackResolve(unittest.TestCase):
             tmdb.tv_detail.return_value = {"name": "Show Name", "original_name": "Show Name"}
 
             ctx = PlanContext(all_files=[f1])
-            prepare_pack_tv_resolve(ctx, tmdb)
+            prepare_pack_tv_resolve(ctx, tmdb, input_root)
 
-            self.assertEqual(ctx.pack_tv_id, 42)
-            self.assertEqual(ctx.pack_series_name, "Show Name")
-            self.assertEqual(ctx.pack_root, root.resolve())
-            self.assertIn(root.resolve(), ctx.series_by_root)
+            self.assertEqual(ctx.entity_packs[show.resolve()], (42, "Show Name"))
+            self.assertIn(show.resolve(), ctx.series_by_root)
 
     def test_resolve_path_extra_under_pack(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "Show (2011)"
-            ep = root / "Season 1" / "S01E01.Pilot.mkv"
-            ex = root / "Featurettes" / "Season 2" / "Bonus.mkv"
+            input_root = Path(td)
+            show = input_root / "Show (2011)"
+            ep = show / "Season 1" / "S01E01.Pilot.mkv"
+            ex = show / "Featurettes" / "Season 2" / "Bonus.mkv"
             ep.parent.mkdir(parents=True, exist_ok=True)
             ex.parent.mkdir(parents=True, exist_ok=True)
             ep.write_bytes(b"")
@@ -135,8 +154,8 @@ class TestPreparePackResolve(unittest.TestCase):
                 ],
             }
 
-            ctx = PlanContext(all_files=[ep, ex])
-            prepare_pack_tv_resolve(ctx, tmdb)
+            ctx = PlanContext(all_files=[ep, ex], input_root=input_root)
+            prepare_pack_tv_resolve(ctx, tmdb, input_root)
 
             out = Path(td) / "out"
             ent_ex = resolve_path(ex, out, tmdb, ctx, ignore_tmdb=False)

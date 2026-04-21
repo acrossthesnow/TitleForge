@@ -15,7 +15,12 @@ from titleforge.classify import guess_kind, looks_episode, looks_movie, parse_sx
 from titleforge.models import PlanEntry, RenamePlan
 from titleforge.nfo import collect_ids_near_video
 from titleforge.normalize import basename_terms, parent_folder_term, strip_release_info
-from titleforge.pack import content_root, infer_season_from_path_ancestors, is_single_tv_pack
+from titleforge.pack import (
+    entity_roots_under_input,
+    infer_season_from_path_ancestors,
+    input_entity_for_path,
+    is_single_tv_pack,
+)
 from titleforge.plex_paths import (
     build_episode_dest,
     build_movie_dest,
@@ -34,9 +39,10 @@ class PlanContext:
     all_files: list[Path]
     series_by_root: dict[Path, tuple[int, str]] = field(default_factory=dict)
     season_cache: dict[tuple[int, int], dict[str, Any]] = field(default_factory=dict)
-    pack_root: Path | None = None
-    pack_tv_id: int | None = None
-    pack_series_name: str | None = None
+    # Resolved ``--input``; pack TV binds only per first-level folder beneath it.
+    input_root: Path | None = None
+    # Top-level entity dir -> (tmdb_tv_id, series_name) from one pack pick per folder.
+    entity_packs: dict[Path, tuple[int, str]] = field(default_factory=dict)
 
     def get_season_json(self, tmdb: TmdbClient, tv_id: int, season: int) -> dict[str, Any]:
         key = (tv_id, season)
@@ -53,75 +59,76 @@ def _path_is_within(root: Path, path: Path) -> bool:
         return False
 
 
-def prepare_pack_tv_resolve(ctx: PlanContext, tmdb: TmdbClient) -> None:
-    """One TV series pick for the whole tree when it looks like a single pack under a common root."""
-    try:
-        root = content_root(ctx.all_files)
-    except ValueError:
-        return
-    if not is_single_tv_pack(ctx.all_files, root):
-        return
-    cleaned = clean_stem_for_search(root.name)
-    query = (cleaned.title or cleaned.raw_stem or root.name).strip()
-    query = re.sub(r"\s+", " ", query).strip()
-    if not query:
-        return
-    try:
-        results = tmdb.search_tv(query, cleaned.year)
-    except TmdbAuthError:
-        raise
-    except Exception:
-        return
-    results = _dedupe_tv(results)
-    y_note = f" (year filter {cleaned.year})" if cleaned.year else ""
-    pack_label = query
-    if not results:
-        _user_notice(
-            root,
-            f"Pack TV search: no results for folder name {query!r}{y_note}; enter a show title below.",
-        )
-        q = questionary.text(
-            "Pack TV search: enter show title:",
-            default=query,
-        ).unsafe_ask()
-        if not q or not q.strip():
-            return
-        pack_label = q.strip()
+def prepare_pack_tv_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root: Path) -> None:
+    """
+    One TV series pick per **first-level folder** under ``--input`` when that subtree
+    looks like a single show pack. Never uses ancestors above ``input_root``.
+    """
+    ir = input_root.resolve()
+    ctx.input_root = ir
+    for entity in entity_roots_under_input(ctx.all_files, ir):
+        subset = [f for f in ctx.all_files if _path_is_within(entity, f)]
+        if not is_single_tv_pack(subset, entity):
+            continue
+        cleaned = clean_stem_for_search(entity.name)
+        query = (cleaned.title or cleaned.raw_stem or entity.name).strip()
+        query = re.sub(r"\s+", " ", query).strip()
+        if not query:
+            continue
         try:
-            results = _dedupe_tv(tmdb.search_tv(pack_label, cleaned.year))
+            results = tmdb.search_tv(query, cleaned.year)
         except TmdbAuthError:
             raise
         except Exception:
-            return
-    if not results:
-        _user_notice(
-            root,
-            f"Pack TV search: still no results for {pack_label!r}{y_note}; continuing without pack binding.",
+            continue
+        results = _dedupe_tv(results)
+        y_note = f" (year filter {cleaned.year})" if cleaned.year else ""
+        pack_label = query
+        if not results:
+            _user_notice(
+                entity,
+                f"Pack TV search: no results for folder name {query!r}{y_note}; enter a show title below.",
+            )
+            q = questionary.text(
+                "Pack TV search: enter show title:",
+                default=query,
+            ).unsafe_ask()
+            if not q or not q.strip():
+                continue
+            pack_label = q.strip()
+            try:
+                results = _dedupe_tv(tmdb.search_tv(pack_label, cleaned.year))
+            except TmdbAuthError:
+                raise
+            except Exception:
+                continue
+        if not results:
+            _user_notice(
+                entity,
+                f"Pack TV search: still no results for {pack_label!r}{y_note}; skipping pack for this folder.",
+            )
+            continue
+        pick = _auto_pick_or_select(
+            "Select TV series (pack)",
+            results,
+            _tv_label,
+            pack_label.lower(),
+            lambda m: (m.get("name") or m.get("original_name") or ""),
+            header_path=entity,
+            style=LIST_STYLE,
+            use_indicator=True,
+            description=_tmdb_overview,
+            filename_year=cleaned.year,
+            extract_year=_year_from_tv_search_row,
         )
-        return
-    pick = _auto_pick_or_select(
-        "Select TV series (pack)",
-        results,
-        _tv_label,
-        pack_label.lower(),
-        lambda m: (m.get("name") or m.get("original_name") or ""),
-        header_path=root,
-        style=LIST_STYLE,
-        use_indicator=True,
-        description=_tmdb_overview,
-        filename_year=cleaned.year,
-        extract_year=_year_from_tv_search_row,
-    )
-    if pick is None:
-        return
-    tv_id = int(pick["id"])
-    detail = tmdb.tv_detail(tv_id)
-    series_name = detail.get("name") or detail.get("original_name") or "Series"
-    r = root.resolve()
-    ctx.pack_root = r
-    ctx.pack_tv_id = tv_id
-    ctx.pack_series_name = series_name
-    ctx.series_by_root[r] = (tv_id, series_name)
+        if pick is None:
+            continue
+        tv_id = int(pick["id"])
+        detail = tmdb.tv_detail(tv_id)
+        series_name = detail.get("name") or detail.get("original_name") or "Series"
+        er = entity.resolve()
+        ctx.entity_packs[er] = (tv_id, series_name)
+        ctx.series_by_root[er] = (tv_id, series_name)
 
 
 def resolve_pack_tv_member(
@@ -129,30 +136,33 @@ def resolve_pack_tv_member(
     output_root: Path,
     tmdb: TmdbClient,
     ctx: PlanContext,
+    entity: Path,
 ) -> PlanEntry:
-    """Resolve one file under ``ctx.pack_root`` using pack-level TV identity."""
-    if ctx.pack_tv_id is None or ctx.pack_series_name is None or ctx.pack_root is None:
+    """Resolve one file under a per-input entity folder using that entity's pack TV identity."""
+    packed = ctx.entity_packs.get(entity.resolve())
+    if packed is None:
         return PlanEntry(src=path, dest=None, kind="skipped", note="Pack context incomplete")
+    tv_id, series_name = packed
 
     if looks_episode(path) or guess_kind(path) == "episode":
         return resolve_episode(path, output_root, tmdb, ctx)
 
-    season = infer_season_from_path_ancestors(path, ctx.pack_root)
+    season = infer_season_from_path_ancestors(path, entity)
     if season is not None:
         title = strip_release_info(path.stem, aggressive=True) or path.stem
         dest = build_season_extra_dest(
             output_root,
-            ctx.pack_series_name,
+            series_name,
             season,
             path,
-            tmdb_tv_id=ctx.pack_tv_id,
+            tmdb_tv_id=tv_id,
             display_title=title,
         )
         return PlanEntry(
             src=path,
             dest=dest,
             kind="extra",
-            tmdb_tv_id=ctx.pack_tv_id,
+            tmdb_tv_id=tv_id,
             season=season,
             episode=None,
             note="pack extra / featurette",
@@ -730,13 +740,10 @@ def resolve_path(
                 tmdb_tv_id=tid,
                 note=note,
             )
-    if (
-        ctx.pack_tv_id is not None
-        and ctx.pack_root is not None
-        and ctx.pack_series_name is not None
-        and _path_is_within(ctx.pack_root, path)
-    ):
-        return resolve_pack_tv_member(path, output_root, tmdb, ctx)
+    if ctx.input_root is not None:
+        ent = input_entity_for_path(ctx.input_root, path)
+        if ent in ctx.entity_packs and _path_is_within(ent, path):
+            return resolve_pack_tv_member(path, output_root, tmdb, ctx, ent)
     g = guess_kind(path)
     if is_series_pack_folder(path, ctx.all_files) and g == "movie":
         g = "ambiguous"
@@ -754,10 +761,15 @@ def build_plan(
     tmdb: TmdbClient,
     *,
     ignore_tmdb: bool = False,
+    input_root: Path | None = None,
 ) -> RenamePlan:
-    ctx = PlanContext(all_files=list(files))
+    ctx = PlanContext(
+        all_files=list(files),
+        input_root=input_root.resolve() if input_root is not None else None,
+    )
     try:
-        prepare_pack_tv_resolve(ctx, tmdb)
+        if ctx.input_root is not None:
+            prepare_pack_tv_resolve(ctx, tmdb, ctx.input_root)
     except TmdbAuthError:
         raise
     entries: list[PlanEntry] = []

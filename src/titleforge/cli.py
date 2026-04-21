@@ -75,7 +75,13 @@ def main(
             raise typer.Exit(1)
         typer.echo(f"Resolving {len(files)} file(s) with TMDB…")
         try:
-            plan = build_plan(files, output_dir, tmdb, ignore_tmdb=ignore_tmdb)
+            plan = build_plan(
+                files,
+                output_dir,
+                tmdb,
+                ignore_tmdb=ignore_tmdb,
+                input_root=input_dir,
+            )
         except TmdbAuthError as e:
             typer.secho(str(e), fg=typer.colors.RED, err=True)
             raise typer.Exit(1) from None

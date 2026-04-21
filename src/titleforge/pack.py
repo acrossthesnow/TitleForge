@@ -9,6 +9,19 @@ from pathlib import Path
 from titleforge.classify import guess_kind, parse_sxe
 from titleforge.series_folder import _SEASON_DIR, is_extras_parent_name
 
+
+def _path_under_or_equal(ancestor: Path, path: Path) -> bool:
+    """True if ``path`` is ``ancestor`` or a descendant of ``ancestor``."""
+    a, p = ancestor.resolve(), path.resolve()
+    if a == p:
+        return True
+    try:
+        p.relative_to(a)
+        return True
+    except ValueError:
+        return False
+
+
 # First path segment under pack root must be season-like or extras parent (all → one show).
 def first_segments_under(root: Path, files: list[Path]) -> set[str]:
     root = root.resolve()
@@ -23,12 +36,15 @@ def first_segments_under(root: Path, files: list[Path]) -> set[str]:
     return segs
 
 
-def content_root(files: list[Path]) -> Path:
+def content_root(files: list[Path], ceiling: Path | None = None) -> Path:
     """
     Deepest directory that contains all files and passes ``is_single_tv_pack``.
 
     Walks from ``os.path.commonpath`` (file parent if a single file was passed) up to
     ancestors and picks the matching path with the longest path (closest to the videos).
+
+    If ``ceiling`` is set, never consider directories **above** it (the scan root, e.g.
+    ``--input``), so a layout like ``Downloads/Torrents/Show`` cannot bind to ``Downloads``.
     """
     if not files:
         raise ValueError("content_root requires at least one file")
@@ -37,11 +53,15 @@ def content_root(files: list[Path]) -> Path:
     if c.is_file():
         c = c.parent
     c = c.resolve()
+    ceiling_r = ceiling.resolve() if ceiling is not None else None
     candidates: list[Path] = []
     cur = c
     while True:
+        cr = cur.resolve()
+        if ceiling_r is not None and not _path_under_or_equal(ceiling_r, cr):
+            break
         if is_single_tv_pack(files, cur):
-            candidates.append(cur.resolve())
+            candidates.append(cr)
         parent = cur.parent.resolve()
         if parent == cur:
             break
@@ -49,6 +69,29 @@ def content_root(files: list[Path]) -> Path:
     if not candidates:
         return c
     return max(candidates, key=lambda p: len(p.parts))
+
+
+def input_entity_for_path(input_root: Path, path: Path) -> Path:
+    """
+    Top-level folder under ``input_root`` that owns ``path`` (or ``input_root`` itself
+    if the file lies directly in the input directory).
+    """
+    ir = input_root.resolve()
+    p = path.resolve()
+    rel = p.relative_to(ir)
+    if not rel.parts:
+        return ir
+    return (ir / rel.parts[0]).resolve()
+
+
+def entity_roots_under_input(files: list[Path], input_root: Path) -> list[Path]:
+    """Sorted unique first-level entities under ``input_root`` that contain at least one file."""
+    roots: dict[Path, None] = {}
+    ir = input_root.resolve()
+    for f in files:
+        e = input_entity_for_path(ir, f)
+        roots[e] = None
+    return sorted(roots.keys(), key=lambda p: str(p).lower())
 
 
 def _root_has_tv_signals(root: Path, files: list[Path]) -> bool:

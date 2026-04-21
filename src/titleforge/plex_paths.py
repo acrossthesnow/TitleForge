@@ -152,6 +152,30 @@ def build_movie_dest(
     return output_root / "Movies" / folder / fname
 
 
+def build_season_extra_dest(
+    output_root: Path,
+    series_name: str,
+    season: int,
+    source_file: Path,
+    *,
+    tmdb_tv_id: int | None = None,
+    display_title: str | None = None,
+) -> Path:
+    """
+    Extras / featurettes without SxxEyy: place under ``Series/<show {tmdb}>/Season NN/`` using a
+    plain sanitized filename (no episode numbering).
+    """
+    ser = sanitize_segment(series_name)
+    series_folder = sanitize_segment(ser + _tmdb_folder_suffix(tmdb_tv_id))
+    if season == 0:
+        sfold = "Specials"
+    else:
+        sfold = f"Season {season:02d}"
+    stem = sanitize_segment(display_title or source_file.stem)
+    fname = sanitize_segment(stem + source_file.suffix)
+    return output_root / "Series" / series_folder / sfold / fname
+
+
 def build_episode_dest(
     output_root: Path,
     series_name: str,

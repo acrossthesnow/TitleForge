@@ -11,6 +11,38 @@ from titleforge.classify import parse_sxe
 _SEASON_DIR = re.compile(r"(?i)^(season\s*\d+|s\d+)$")
 _SERIES_WORDS = re.compile(r"(?i)\b(season|series|complete|volume|vol\.?)\b")
 
+_EXTRAS_PARENT_NORMALIZED = frozenset(
+    {
+        "featurettes",
+        "extras",
+        "bonus",
+        "interviews",
+        "deleted scenes",
+        "behind the scenes",
+        "behind-the-scenes",
+    }
+)
+
+
+def _normalize_folder_name(name: str) -> str:
+    return re.sub(r"\s+", " ", name.strip()).casefold()
+
+
+def is_extras_parent_name(name: str) -> bool:
+    """True if ``name`` is a common extras / featurettes container folder."""
+    return _normalize_folder_name(name) in _EXTRAS_PARENT_NORMALIZED
+
+
+def _walk_past_extras_containers(p: Path) -> Path:
+    """Ascend past Featurettes / Extras / … so the series root is the real show folder."""
+    cur = p.resolve()
+    while cur.name and is_extras_parent_name(cur.name):
+        parent = cur.parent.resolve()
+        if parent == cur:
+            break
+        cur = parent
+    return cur
+
 
 def _siblings_same_parent(path: Path, all_files: list[Path]) -> list[Path]:
     d = path.parent.resolve()
@@ -36,6 +68,7 @@ def series_group_root(path: Path, all_files: list[Path]) -> Path | None:
     if _SEASON_DIR.match(name):
         gp = parent.parent
         if gp != parent.anchor and gp.name:
+            gp = _walk_past_extras_containers(gp)
             return gp.resolve()
         return parent
 

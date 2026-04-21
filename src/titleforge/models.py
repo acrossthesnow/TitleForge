@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-MediaKind = Literal["movie", "episode", "skipped"]
+MediaKind = Literal["movie", "episode", "extra", "skipped"]
 
 
 @dataclass

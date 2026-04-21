@@ -160,10 +160,12 @@ def build_season_extra_dest(
     *,
     tmdb_tv_id: int | None = None,
     display_title: str | None = None,
+    plex_extra_folder: str = "Other",
 ) -> Path:
     """
-    Extras / featurettes without SxxEyy: place under ``Series/<show {tmdb}>/Season NN/`` using a
-    plain sanitized filename (no episode numbering).
+    Extras without SxxEyy: under ``Series/<show {tmdb}>/<Season NN|Specials>/<Plex extra type>/``
+    with a plain sanitized filename, matching Plex local extras folders (see Plex support:
+    "Organized in Subdirectories").
     """
     ser = sanitize_segment(series_name)
     series_folder = sanitize_segment(ser + _tmdb_folder_suffix(tmdb_tv_id))
@@ -171,9 +173,10 @@ def build_season_extra_dest(
         sfold = "Specials"
     else:
         sfold = f"Season {season:02d}"
+    extra_dir = sanitize_segment(plex_extra_folder) or "Other"
     stem = sanitize_segment(display_title or source_file.stem)
     fname = sanitize_segment(stem + source_file.suffix)
-    return output_root / "Series" / series_folder / sfold / fname
+    return output_root / "Series" / series_folder / sfold / extra_dir / fname
 
 
 def build_episode_dest(

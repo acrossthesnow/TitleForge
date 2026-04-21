@@ -6,22 +6,13 @@ import re
 from pathlib import Path
 
 from titleforge.classify import parse_sxe
+from titleforge.extra_category import all_extras_container_normalized
 
 # Folder name hints: "Season 1", "S01", "Complete Series", etc.
 _SEASON_DIR = re.compile(r"(?i)^(season\s*\d+|s\d+)$")
 _SERIES_WORDS = re.compile(r"(?i)\b(season|series|complete|volume|vol\.?)\b")
 
-_EXTRAS_PARENT_NORMALIZED = frozenset(
-    {
-        "featurettes",
-        "extras",
-        "bonus",
-        "interviews",
-        "deleted scenes",
-        "behind the scenes",
-        "behind-the-scenes",
-    }
-)
+_EXTRAS_PARENT_NORMALIZED = all_extras_container_normalized()
 
 
 def _normalize_folder_name(name: str) -> str:

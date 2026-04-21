@@ -15,6 +15,7 @@ from titleforge.pack import (
     input_entity_for_path,
     is_single_tv_pack,
 )
+from titleforge.extra_category import infer_plex_extra_folder
 from titleforge.plex_paths import build_season_extra_dest
 from titleforge.resolve import PlanContext, prepare_pack_tv_resolve, resolve_path
 from titleforge.series_folder import series_group_root
@@ -93,10 +94,48 @@ class TestInferSeason(unittest.TestCase):
         self.assertEqual(infer_season_from_path_ancestors(p, pack), 2)
 
 
+class TestInferPlexExtraFolder(unittest.TestCase):
+    def test_featurettes_ancestor(self) -> None:
+        ent = Path("/in/Mad Men")
+        p = ent / "Featurettes" / "Season 2" / "Bonus.mkv"
+        self.assertEqual(infer_plex_extra_folder(p, entity_root=ent), "Featurettes")
+
+    def test_flat_season_file_is_other(self) -> None:
+        ent = Path("/in/Mad Men")
+        p = ent / "Season 07" / "Gay Rights.mkv"
+        self.assertEqual(infer_plex_extra_folder(p, entity_root=ent), "Other")
+
+    def test_nearest_extra_folder_wins(self) -> None:
+        ent = Path("/in/Show")
+        p = ent / "Trailers" / "Featurettes" / "Season 1" / "x.mkv"
+        self.assertEqual(infer_plex_extra_folder(p, entity_root=ent), "Featurettes")
+
+    def test_inline_suffix_trailer(self) -> None:
+        ent = Path("/in/Show")
+        p = ent / "Season 1" / "Teaser Trailer-trailer.mkv"
+        self.assertEqual(infer_plex_extra_folder(p, entity_root=ent), "Trailers")
+
+    def test_inline_suffix_behindthescenes(self) -> None:
+        ent = Path("/in/Show")
+        p = ent / "Season 1" / "Making Of-behindthescenes.mkv"
+        self.assertEqual(infer_plex_extra_folder(p, entity_root=ent), "Behind The Scenes")
+
+    def test_clips_maps_to_other(self) -> None:
+        ent = Path("/in/Show")
+        p = ent / "Season 1" / "Clips" / "a.mkv"
+        self.assertEqual(infer_plex_extra_folder(p, entity_root=ent), "Other")
+
+    def test_theme_music_maps_to_other(self) -> None:
+        ent = Path("/in/Show")
+        p = ent / "Season 1" / "theme-music" / "t.mkv"
+        self.assertEqual(infer_plex_extra_folder(p, entity_root=ent), "Other")
+
+
 class TestBuildSeasonExtraDest(unittest.TestCase):
     def test_extra_under_season_folder(self) -> None:
         out = Path("/lib")
         src = Path("/in/Featurettes/Season 2/An Era of Style.mkv")
+        cat = infer_plex_extra_folder(src, entity_root=Path("/in"))
         d = build_season_extra_dest(
             out,
             "Mad Men",
@@ -104,11 +143,19 @@ class TestBuildSeasonExtraDest(unittest.TestCase):
             src,
             tmdb_tv_id=1100,
             display_title="An Era of Style",
+            plex_extra_folder=cat,
         )
         self.assertIn("Series", d.parts)
         self.assertIn("Season 02", d.parts)
+        self.assertIn("Featurettes", d.parts)
         self.assertTrue(d.name.endswith(".mkv"))
         self.assertIn("An Era of Style", d.name)
+
+    def test_default_category_is_other(self) -> None:
+        out = Path("/lib")
+        src = Path("/in") / "Season 2" / "orphan.mkv"
+        d = build_season_extra_dest(out, "Show", 2, src, tmdb_tv_id=1)
+        self.assertIn("Other", d.parts)
 
 
 class TestPreparePackResolve(unittest.TestCase):
@@ -163,6 +210,7 @@ class TestPreparePackResolve(unittest.TestCase):
             self.assertEqual(ent_ex.season, 2)
             self.assertIsNotNone(ent_ex.dest)
             self.assertIn("Season 02", str(ent_ex.dest))
+            self.assertIn("Featurettes", ent_ex.dest.parts)
 
             ent_ep = resolve_path(ep, out, tmdb, ctx, ignore_tmdb=False)
             self.assertEqual(ent_ep.kind, "episode")

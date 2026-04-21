@@ -12,6 +12,7 @@ import questionary
 from questionary import Style
 
 from titleforge.classify import guess_kind, looks_episode, looks_movie, parse_sxe, series_query_string
+from titleforge.extra_category import infer_plex_extra_folder
 from titleforge.models import PlanEntry, RenamePlan
 from titleforge.nfo import collect_ids_near_video
 from titleforge.normalize import basename_terms, parent_folder_term, strip_release_info
@@ -150,6 +151,7 @@ def resolve_pack_tv_member(
     season = infer_season_from_path_ancestors(path, entity)
     if season is not None:
         title = strip_release_info(path.stem, aggressive=True) or path.stem
+        extra_cat = infer_plex_extra_folder(path, entity_root=entity)
         dest = build_season_extra_dest(
             output_root,
             series_name,
@@ -157,6 +159,7 @@ def resolve_pack_tv_member(
             path,
             tmdb_tv_id=tv_id,
             display_title=title,
+            plex_extra_folder=extra_cat,
         )
         return PlanEntry(
             src=path,
@@ -165,7 +168,7 @@ def resolve_pack_tv_member(
             tmdb_tv_id=tv_id,
             season=season,
             episode=None,
-            note="pack extra / featurette",
+            note=f"pack extra ({extra_cat})",
         )
 
     if looks_movie(path) and guess_kind(path) == "movie":

@@ -78,7 +78,3 @@ twine check dist/*
 Smoke-test the wheel in a **fresh** venv: `python -m venv /tmp/tf-smoke && /tmp/tf-smoke/bin/pip install dist/titleforge-*.whl && /tmp/tf-smoke/bin/titleforge --help`
 
 Installed package version: `titleforge --version` (matches `pyproject.toml` / `titleforge.__version__`).
-
-### PyPI (optional)
-
-Register the **`titleforge`** name on PyPI, create an API token or [trusted publisher](https://docs.pypi.org/trusted-publishers/), then from a clean tree with `dist/` built: `twine upload dist/*`. Update **`[project.urls]`** in `pyproject.toml` to your real repo before the first upload if placeholders are still in place.

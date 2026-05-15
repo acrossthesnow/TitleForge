@@ -28,7 +28,7 @@ from titleforge.plex_paths import (
     build_season_extra_dest,
     parse_tmdb_tag_from_path,
 )
-from titleforge.prompt_ui import LIST_STYLE, clear_tty
+from titleforge.prompt_ui import LIST_STYLE, SearchType, clear_tty, prompt_search_with_type
 from titleforge.query_clean import CleanedQuery, clean_stem_for_search
 from titleforge.series_folder import is_series_pack_folder, series_group_root
 from titleforge.tmdb_client import TmdbClient
@@ -90,13 +90,21 @@ def prepare_pack_tv_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root: Path
                 entity,
                 f"Pack TV search: no results for folder name {query!r}{y_note}; enter a show title below.",
             )
-            q = questionary.text(
+            res = prompt_search_with_type(
                 "Pack TV search: enter show title:",
                 default=query,
-            ).unsafe_ask()
-            if not q or not q.strip():
+                initial_type="tv",
+            )
+            if res is None:
                 continue
-            pack_label = q.strip()
+            pack_search_type, pack_label = res
+            if pack_search_type != "tv":
+                _user_notice(
+                    entity,
+                    f"Pack TV search: type switched to {pack_search_type!r}; skipping pack binding "
+                    "for this folder — member files will resolve individually.",
+                )
+                continue
             try:
                 results = _dedupe_tv(tmdb.search_tv(pack_label, cleaned.year))
             except TmdbAuthError:
@@ -172,7 +180,7 @@ def resolve_pack_tv_member(
         )
 
     if looks_movie(path) and guess_kind(path) == "movie":
-        return resolve_movie(path, output_root, tmdb)
+        return resolve_movie(path, output_root, tmdb, ctx)
 
     return resolve_ambiguous_dual(path, output_root, tmdb, ctx)
 
@@ -407,13 +415,24 @@ def resolve_ambiguous_dual(
             path,
             f"No TMDB movie or TV results for {q0!r}{y_note}; enter a different search title below.",
         )
-        mq = questionary.text(
+        res = prompt_search_with_type(
             "No TMDB movie or TV hits. Enter search title:",
             default=cleaned.title or cleaned.raw_stem,
-        ).unsafe_ask()
-        if not mq or not mq.strip():
+            initial_type="both",
+        )
+        if res is None:
             return PlanEntry(src=path, dest=None, kind="skipped", note="No dual-search query")
-        search_label = mq.strip()
+        dual_type, search_label = res
+        if dual_type != "both":
+            return _manual_dispatch(
+                search_type=dual_type,
+                query=search_label,
+                year=cleaned.year,
+                path=path,
+                output_root=output_root,
+                tmdb=tmdb,
+                ctx=ctx,
+            )
         candidates = _gather_dual_candidates(
             tmdb,
             CleanedQuery(title=search_label, year=cleaned.year, raw_stem=cleaned.raw_stem, stripped_year_note=cleaned.stripped_year_note),
@@ -546,10 +565,160 @@ def _finalize_episode(
     )
 
 
+def _manual_movie(
+    query: str,
+    year: int | None,
+    path: Path,
+    output_root: Path,
+    tmdb: TmdbClient,
+) -> PlanEntry:
+    try:
+        merged = _dedupe_movies(tmdb.search_movie(query, year))
+    except TmdbAuthError:
+        raise
+    except Exception as e:
+        return PlanEntry(src=path, dest=None, kind="skipped", note=f"Movie search error: {e}")
+    yh = f" (year {year})" if year else ""
+    if not merged:
+        _user_notice(path, f"No TMDB movie results for {query!r}{yh}; skipping.")
+        return PlanEntry(src=path, dest=None, kind="skipped", note="No movie results")
+    pick = _auto_pick_or_select(
+        "Select movie",
+        merged,
+        _movie_label,
+        query.lower().strip(),
+        lambda m: (m.get("title") or m.get("original_title") or ""),
+        header_path=path,
+        style=LIST_STYLE,
+        use_indicator=True,
+        description=_tmdb_overview,
+        filename_year=year,
+        extract_year=_year_from_movie_search_row,
+    )
+    if pick is None:
+        return PlanEntry(src=path, dest=None, kind="skipped", note="Cancelled movie pick")
+    mid = int(pick["id"])
+    detail = tmdb.movie_detail(mid)
+    title = detail.get("title") or detail.get("original_title") or "Unknown"
+    y = _year_from_movie(detail)
+    dest = build_movie_dest(output_root, title, y, path, tmdb_movie_id=mid)
+    return PlanEntry(src=path, dest=dest, kind="movie", tmdb_movie_id=mid)
+
+
+def _manual_tv(
+    query: str,
+    year: int | None,
+    path: Path,
+    output_root: Path,
+    tmdb: TmdbClient,
+    ctx: PlanContext,
+) -> PlanEntry:
+    try:
+        results = _dedupe_tv(tmdb.search_tv(query, year))
+    except TmdbAuthError:
+        raise
+    except Exception as e:
+        return PlanEntry(src=path, dest=None, kind="skipped", note=f"TV search error: {e}")
+    yh = f" (year {year})" if year else ""
+    if not results:
+        _user_notice(path, f"No TMDB TV results for {query!r}{yh}; skipping.")
+        return PlanEntry(src=path, dest=None, kind="skipped", note="No TV results")
+    pick = _auto_pick_or_select(
+        "Select TV series",
+        results,
+        _tv_label,
+        query.lower().strip(),
+        lambda m: (m.get("name") or m.get("original_name") or ""),
+        header_path=path,
+        style=LIST_STYLE,
+        use_indicator=True,
+        description=_tmdb_overview,
+        filename_year=year,
+        extract_year=_year_from_tv_search_row,
+    )
+    if pick is None:
+        return PlanEntry(src=path, dest=None, kind="skipped", note="Cancelled series pick")
+    tv_id = int(pick["id"])
+    detail = tmdb.tv_detail(tv_id)
+    series_name = detail.get("name") or detail.get("original_name") or "Series"
+    root = series_group_root(path, ctx.all_files)
+    if root is not None:
+        ctx.series_by_root[root] = (tv_id, series_name)
+    return _finalize_episode(path, output_root, tmdb, ctx, tv_id, series_name)
+
+
+def _manual_dual(
+    query: str,
+    year: int | None,
+    path: Path,
+    output_root: Path,
+    tmdb: TmdbClient,
+    ctx: PlanContext,
+) -> PlanEntry:
+    cleaned = CleanedQuery(title=query, year=year, raw_stem=query, stripped_year_note=None)
+    try:
+        candidates = _gather_dual_candidates(tmdb, cleaned, manual_query=query)
+    except TmdbAuthError:
+        raise
+    yh = f" (year {year})" if year else ""
+    if not candidates:
+        _user_notice(path, f"No TMDB results for {query!r}{yh}; skipping.")
+        return PlanEntry(src=path, dest=None, kind="skipped", note="No dual results")
+    pick = _auto_pick_or_select(
+        "Select movie or TV match",
+        candidates,
+        _dual_choice_label,
+        query.lower().strip(),
+        _dual_key_fn,
+        header_path=path,
+        style=LIST_STYLE,
+        use_indicator=True,
+        description=lambda hit: _tmdb_overview(hit[1]),
+        filename_year=year,
+        extract_year=_year_from_tagged_hit,
+    )
+    if pick is None:
+        return PlanEntry(src=path, dest=None, kind="skipped", note="Cancelled dual pick")
+    kind, row = pick
+    if kind == "movie":
+        mid = int(row["id"])
+        detail = tmdb.movie_detail(mid)
+        title = detail.get("title") or detail.get("original_title") or "Unknown"
+        y = _year_from_movie(detail)
+        dest = build_movie_dest(output_root, title, y, path, tmdb_movie_id=mid)
+        return PlanEntry(src=path, dest=dest, kind="movie", tmdb_movie_id=mid)
+    tv_id = int(row["id"])
+    detail = tmdb.tv_detail(tv_id)
+    series_name = detail.get("name") or detail.get("original_name") or "Series"
+    root = series_group_root(path, ctx.all_files)
+    if root is not None:
+        ctx.series_by_root[root] = (tv_id, series_name)
+    return _finalize_episode(path, output_root, tmdb, ctx, tv_id, series_name)
+
+
+def _manual_dispatch(
+    *,
+    search_type: SearchType,
+    query: str,
+    year: int | None,
+    path: Path,
+    output_root: Path,
+    tmdb: TmdbClient,
+    ctx: PlanContext,
+) -> PlanEntry:
+    """Re-route a manual no-results prompt to the user-toggled search type."""
+    if search_type == "movie":
+        return _manual_movie(query, year, path, output_root, tmdb)
+    if search_type == "tv":
+        return _manual_tv(query, year, path, output_root, tmdb, ctx)
+    return _manual_dual(query, year, path, output_root, tmdb, ctx)
+
+
 def resolve_movie(
     path: Path,
     output_root: Path,
     tmdb: TmdbClient,
+    ctx: PlanContext,
 ) -> PlanEntry:
     imdb_id, tmdb_movie_id, _tmdb_tv_id = collect_ids_near_video(path)
     if tmdb_movie_id:
@@ -610,12 +779,27 @@ def resolve_movie(
             path,
             f"No TMDB movie results from automated title queries{yh}; enter a manual search below.",
         )
-        q = questionary.text("No TMDB movie hits. Enter search query:", default=primary_name).unsafe_ask()
-        if not q:
+        res = prompt_search_with_type(
+            "No TMDB movie hits. Enter search query:",
+            default=primary_name,
+            initial_type="movie",
+        )
+        if res is None:
             return PlanEntry(src=path, dest=None, kind="skipped", note="No query")
-        merged = _dedupe_movies(tmdb.search_movie(q.strip(), year_hint))
+        movie_type, manual_query = res
+        if movie_type != "movie":
+            return _manual_dispatch(
+                search_type=movie_type,
+                query=manual_query,
+                year=year_hint,
+                path=path,
+                output_root=output_root,
+                tmdb=tmdb,
+                ctx=ctx,
+            )
+        merged = _dedupe_movies(tmdb.search_movie(manual_query, year_hint))
         if not merged:
-            _user_notice(path, f"No TMDB movie results for manual query {q.strip()!r}{yh}; skipping.")
+            _user_notice(path, f"No TMDB movie results for manual query {manual_query!r}{yh}; skipping.")
             return PlanEntry(src=path, dest=None, kind="skipped", note="No movie results")
 
     # Title similarity for auto-pick / menu order: use cleaned title only. Joining raw stem +
@@ -662,6 +846,7 @@ def resolve_episode(
             qn = re.sub(r"\s+", " ", qn).strip()
             if qn:
                 query = qn
+        stem_cleaned = clean_stem_for_search(path.stem)
         try:
             results = tmdb.search_tv(query)
         except TmdbAuthError:
@@ -675,18 +860,33 @@ def resolve_episode(
                 path,
                 f"No TMDB TV results for show query {query!r}; enter a different title below.",
             )
-            q = questionary.text("No TMDB TV hits. Enter show search:", default=query).unsafe_ask()
-            if not q:
+            res = prompt_search_with_type(
+                "No TMDB TV hits. Enter show search:",
+                default=query,
+                initial_type="tv",
+            )
+            if res is None:
                 return PlanEntry(src=path, dest=None, kind="skipped", note="No show query")
-            results = _dedupe_tv(tmdb.search_tv(q.strip()))
+            ep_type, ep_query = res
+            if ep_type != "tv":
+                return _manual_dispatch(
+                    search_type=ep_type,
+                    query=ep_query,
+                    year=stem_cleaned.year,
+                    path=path,
+                    output_root=output_root,
+                    tmdb=tmdb,
+                    ctx=ctx,
+                )
+            query = ep_query
+            results = _dedupe_tv(tmdb.search_tv(query))
         if not results:
             _user_notice(
                 path,
-                f"Still no TMDB TV results for {q.strip()!r}; skipping this file.",
+                f"Still no TMDB TV results for {query!r}; skipping this file.",
             )
             return PlanEntry(src=path, dest=None, kind="skipped", note="No TV results")
 
-        stem_cleaned = clean_stem_for_search(path.stem)
         pick = _auto_pick_or_select(
             "Select TV series",
             results,
@@ -755,7 +955,7 @@ def resolve_path(
         return resolve_ambiguous_dual(path, output_root, tmdb, ctx)
     if g == "episode":
         return resolve_episode(path, output_root, tmdb, ctx)
-    return resolve_movie(path, output_root, tmdb)
+    return resolve_movie(path, output_root, tmdb, ctx)
 
 
 def build_plan(

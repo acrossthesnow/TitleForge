@@ -66,7 +66,10 @@ _reg(["scenes", "scene"], "Scenes")
 _reg(["shorts", "short"], "Shorts")
 _reg(["trailers", "trailer"], "Trailers")
 _reg(["clips", "clip"], "Other")
-_reg(["samples", "sample"], "Other")
+# `Sample`/`Samples` intentionally NOT registered: sample files are filtered by
+# discover.is_sample_path, and treating a Sample/ folder as an extras container
+# (via series_folder.is_extras_parent_name → pack._root_has_tv_signals) wrongly
+# tips movie release folders like `The.Martian.2015...-TERMiNAL/` into pack-TV mode.
 _reg(["extras", "extra"], "Other")
 _reg(["other"], "Other")
 _reg(["theme music", "thememusic", "theme-music", "theme song", "themesong"], "Other")

@@ -26,13 +26,24 @@ from titleforge.plex_paths import (
     build_episode_dest,
     build_movie_dest,
     build_season_extra_dest,
+    movie_name_with_year,
     parse_tmdb_tag_from_path,
+    sanitize_segment,
 )
 from titleforge.prompt_ui import LIST_STYLE, SearchType, clear_tty, prompt_search_with_type
 from titleforge.query_clean import CleanedQuery, clean_stem_for_search
-from titleforge.series_folder import is_series_pack_folder, series_group_root
+from titleforge.series_folder import is_extras_parent_name, is_series_pack_folder, series_group_root
 from titleforge.tmdb_client import TmdbClient
 from titleforge.tmdb_errors import TmdbAuthError
+
+
+@dataclass
+class MovieEntityBinding:
+    """One TMDB movie pick bound to a top-level entity folder (movie-folder pre-resolve)."""
+
+    tmdb_movie_id: int
+    title: str
+    year: int | None
 
 
 @dataclass
@@ -44,6 +55,8 @@ class PlanContext:
     input_root: Path | None = None
     # Top-level entity dir -> (tmdb_tv_id, series_name) from one pack pick per folder.
     entity_packs: dict[Path, tuple[int, str]] = field(default_factory=dict)
+    # Top-level entity dir -> single TMDB movie bound for the folder.
+    entity_movies: dict[Path, MovieEntityBinding] = field(default_factory=dict)
 
     def get_season_json(self, tmdb: TmdbClient, tv_id: int, season: int) -> dict[str, Any]:
         key = (tv_id, season)
@@ -60,6 +73,21 @@ def _path_is_within(root: Path, path: Path) -> bool:
         return False
 
 
+def _is_under_extras_container(path: Path, entity_root: Path) -> bool:
+    """True if any ancestor of ``path`` (strictly below ``entity_root``) is an
+    extras-parent folder name (Featurettes / Deleted Scenes / …)."""
+    cur = path.parent.resolve()
+    stop = entity_root.resolve()
+    while cur != stop and cur.name:
+        if is_extras_parent_name(cur.name):
+            return True
+        nxt = cur.parent.resolve()
+        if nxt == cur:
+            break
+        cur = nxt
+    return False
+
+
 def prepare_pack_tv_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root: Path) -> None:
     """
     One TV series pick per **first-level folder** under ``--input`` when that subtree
@@ -73,6 +101,9 @@ def prepare_pack_tv_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root: Path
             continue
         cleaned = clean_stem_for_search(entity.name)
         query = (cleaned.title or cleaned.raw_stem or entity.name).strip()
+        # Strip season / series-pack hints baked into the folder name so e.g.
+        # `Firefly (2002) Season 1 S01 (1080p ...)` searches as `Firefly`.
+        query = re.sub(r"(?i)\b(S\d{1,4}|Season\s*\d{1,4}|Complete(?:\s*Series)?)\b", " ", query)
         query = re.sub(r"\s+", " ", query).strip()
         if not query:
             continue
@@ -98,11 +129,18 @@ def prepare_pack_tv_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root: Path
             if res is None:
                 continue
             pack_search_type, pack_label = res
-            if pack_search_type != "tv":
+            if pack_search_type == "movie":
+                # User says this isn't a TV pack — try the typed query as a movie
+                # folder binding right now so the decision is visible (not silently
+                # deferred to per-file resolution where the original folder name
+                # gets re-searched instead of what they typed).
+                _bind_movie_entity_from_query(ctx, tmdb, entity, pack_label, cleaned.year)
+                continue
+            if pack_search_type == "both":
                 _user_notice(
                     entity,
-                    f"Pack TV search: type switched to {pack_search_type!r}; skipping pack binding "
-                    "for this folder — member files will resolve individually.",
+                    f"Pack TV search: type switched to 'both'; skipping pack binding for this "
+                    f"folder. Member files will resolve individually using query {pack_label!r}.",
                 )
                 continue
             try:
@@ -138,6 +176,169 @@ def prepare_pack_tv_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root: Path
         er = entity.resolve()
         ctx.entity_packs[er] = (tv_id, series_name)
         ctx.series_by_root[er] = (tv_id, series_name)
+        _user_notice(entity, f"Pack TV bound: {series_name} {{tmdb-{tv_id}}}")
+
+
+_COLLECTION_HINT = re.compile(r"(?i)\b(collection|trilogy|anthology|saga|box\s*set|complete)\b")
+_FOLDER_YEAR = re.compile(r"\b((?:19|20)\d{2})\b")
+
+
+def _is_movie_collection_name(name: str) -> bool:
+    """A folder is treated as a multi-movie collection (no entity binding) when its
+    name says so ("COLLECTION", "Trilogy", …) or contains multiple distinct years."""
+    if _COLLECTION_HINT.search(name):
+        return True
+    years = set(_FOLDER_YEAR.findall(name))
+    return len(years) > 1
+
+
+def prepare_movie_entity_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root: Path) -> None:
+    """
+    One TMDB movie pick per top-level folder under ``--input`` when the folder name
+    parses as ``Title (YYYY)`` / ``Title.YYYY.release-tail`` and the folder isn't
+    already a TV pack. Runs **after** :func:`prepare_pack_tv_resolve` so that pack-TV
+    bindings always win.
+    """
+    ir = input_root.resolve()
+    ctx.input_root = ir
+    for entity in entity_roots_under_input(ctx.all_files, ir):
+        er = entity.resolve()
+        if er in ctx.entity_packs:
+            continue
+        if not entity.is_dir():
+            # Top-level loose files are resolved per-file by resolve_path; no binding.
+            continue
+        if _is_movie_collection_name(entity.name):
+            _user_notice(
+                entity,
+                "Movie folder: looks like a collection (multiple years / 'COLLECTION' hint); "
+                "files will resolve individually.",
+            )
+            continue
+        cleaned = clean_stem_for_search(entity.name)
+        title = (cleaned.title or "").strip()
+        year = cleaned.year
+        if not title or year is None:
+            continue
+        try:
+            results = _dedupe_movies(tmdb.search_movie(title, year))
+        except TmdbAuthError:
+            raise
+        except Exception:
+            continue
+        if not results:
+            _user_notice(entity, f"Movie folder search: no TMDB hits for {title!r} ({year}); files will resolve individually.")
+            continue
+        pick = _auto_pick_or_select(
+            "Select movie (folder)",
+            results,
+            _movie_label,
+            title.lower(),
+            lambda m: (m.get("title") or m.get("original_title") or ""),
+            header_path=entity,
+            style=LIST_STYLE,
+            use_indicator=True,
+            description=_tmdb_overview,
+            filename_year=year,
+            extract_year=_year_from_movie_search_row,
+        )
+        if pick is None:
+            continue
+        mid = int(pick["id"])
+        detail = tmdb.movie_detail(mid)
+        full_title = detail.get("title") or detail.get("original_title") or title
+        full_year = _year_from_movie(detail) or year
+        ctx.entity_movies[er] = MovieEntityBinding(
+            tmdb_movie_id=mid, title=full_title, year=full_year
+        )
+        _user_notice(entity, f"Movie folder bound: {full_title} ({full_year}) {{tmdb-{mid}}}")
+
+
+def _bind_movie_entity_from_query(
+    ctx: PlanContext,
+    tmdb: TmdbClient,
+    entity: Path,
+    query: str,
+    year: int | None,
+) -> None:
+    """Search TMDB for ``query`` and bind the result to the entity as a movie folder.
+
+    Used when the pack-TV manual prompt is toggled to Movie — we want the user's
+    typed text to drive the search and the chosen title to be logged immediately,
+    not silently deferred to per-file resolution.
+    """
+    try:
+        results = _dedupe_movies(tmdb.search_movie(query, year))
+    except TmdbAuthError:
+        raise
+    except Exception as e:
+        _user_notice(entity, f"Pack TV → movie search failed: {e}")
+        return
+    y_note = f" ({year})" if year else ""
+    if not results:
+        _user_notice(
+            entity,
+            f"Pack TV → movie search: no TMDB hits for {query!r}{y_note}; "
+            "member files will resolve individually.",
+        )
+        return
+    pick = _auto_pick_or_select(
+        "Select movie (folder)",
+        results,
+        _movie_label,
+        query.lower(),
+        lambda m: (m.get("title") or m.get("original_title") or ""),
+        header_path=entity,
+        style=LIST_STYLE,
+        use_indicator=True,
+        description=_tmdb_overview,
+        filename_year=year,
+        extract_year=_year_from_movie_search_row,
+    )
+    if pick is None:
+        _user_notice(entity, "Pack TV → movie search cancelled; member files will resolve individually.")
+        return
+    mid = int(pick["id"])
+    detail = tmdb.movie_detail(mid)
+    full_title = detail.get("title") or detail.get("original_title") or query
+    full_year = _year_from_movie(detail) or year
+    ctx.entity_movies[entity.resolve()] = MovieEntityBinding(
+        tmdb_movie_id=mid, title=full_title, year=full_year
+    )
+    _user_notice(entity, f"Pack TV → movie folder bound: {full_title} ({full_year}) {{tmdb-{mid}}}")
+
+
+def resolve_movie_entity_member(
+    path: Path,
+    output_root: Path,
+    ctx: PlanContext,
+    entity: Path,
+) -> PlanEntry:
+    """Resolve one file under a movie-bound entity folder."""
+    bind = ctx.entity_movies.get(entity.resolve())
+    if bind is None:
+        return PlanEntry(src=path, dest=None, kind="skipped", note="Movie entity context incomplete")
+
+    # Plex movie local extras: non-main video inside Featurettes/, Deleted Scenes/, etc.
+    if _is_under_extras_container(path, entity):
+        extra_cat = infer_plex_extra_folder(path, entity_root=entity)
+        ny = movie_name_with_year(bind.title, bind.year)
+        movie_folder = sanitize_segment(ny + f" {{tmdb-{bind.tmdb_movie_id}}}")
+        stem = sanitize_segment(strip_release_info(path.stem, aggressive=True) or path.stem)
+        fname = sanitize_segment(stem + path.suffix)
+        dest = output_root / "Movies" / movie_folder / extra_cat / fname
+        return PlanEntry(
+            src=path,
+            dest=dest,
+            kind="extra",
+            tmdb_movie_id=bind.tmdb_movie_id,
+            note=f"movie folder extra ({extra_cat})",
+        )
+
+    dest = build_movie_dest(
+        output_root, bind.title, bind.year, path, tmdb_movie_id=bind.tmdb_movie_id
+    )
+    return PlanEntry(src=path, dest=dest, kind="movie", tmdb_movie_id=bind.tmdb_movie_id)
 
 
 def resolve_pack_tv_member(
@@ -157,6 +358,9 @@ def resolve_pack_tv_member(
         return resolve_episode(path, output_root, tmdb, ctx)
 
     season = infer_season_from_path_ancestors(path, entity)
+    if season is None and _is_under_extras_container(path, entity):
+        # Featurettes/foo.mkv with no Season ancestor → Plex Specials extras.
+        season = 0
     if season is not None:
         title = strip_release_info(path.stem, aggressive=True) or path.stem
         extra_cat = infer_plex_extra_folder(path, entity_root=entity)
@@ -947,6 +1151,8 @@ def resolve_path(
         ent = input_entity_for_path(ctx.input_root, path)
         if ent in ctx.entity_packs and _path_is_within(ent, path):
             return resolve_pack_tv_member(path, output_root, tmdb, ctx, ent)
+        if ent in ctx.entity_movies and _path_is_within(ent, path):
+            return resolve_movie_entity_member(path, output_root, ctx, ent)
     g = guess_kind(path)
     if is_series_pack_folder(path, ctx.all_files) and g == "movie":
         g = "ambiguous"
@@ -973,6 +1179,7 @@ def build_plan(
     try:
         if ctx.input_root is not None:
             prepare_pack_tv_resolve(ctx, tmdb, ctx.input_root)
+            prepare_movie_entity_resolve(ctx, tmdb, ctx.input_root)
     except TmdbAuthError:
         raise
     entries: list[PlanEntry] = []

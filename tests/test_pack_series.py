@@ -58,6 +58,37 @@ class TestPackHeuristics(unittest.TestCase):
         ]
         self.assertFalse(is_single_tv_pack(files, root))
 
+    def test_movie_folder_with_sample_subdir_is_not_pack(self) -> None:
+        """Regression for The Martian: Sample/ must not tip a movie folder into pack TV."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "The.Martian.2015.EXTENDED.x265-TERMiNAL"
+            sample = root / "Sample"
+            sample.mkdir(parents=True)
+            (sample / "junk.mkv").write_bytes(b"")
+            main = root / "The.Martian.2015.EXTENDED.x265-TERMiNAL.mkv"
+            main.write_bytes(b"")
+            self.assertFalse(is_single_tv_pack([main], root))
+
+    def test_firefly_loose_episodes_and_featurettes_is_pack(self) -> None:
+        """Loose SxxEyy episodes at entity root + Featurettes/ should bind as one pack."""
+        root = Path("/t/Firefly (2002) Season 1 S01")
+        files = [
+            root / "Firefly (2002) - S01E01 - Serenity.mkv",
+            root / "Firefly (2002) - S01E02 - The Train Job.mkv",
+            root / "Featurettes" / "Gag Reel.mkv",
+        ]
+        self.assertTrue(is_single_tv_pack(files, root))
+
+    def test_movie_collection_is_not_pack(self) -> None:
+        """Jurassic Park COLLECTION: multiple loose Title.YYYY.*.mkv files, no SxxEyy."""
+        root = Path("/t/Jurassic Park COLLECTION 1993-2015")
+        files = [
+            root / "Jurassic.Park.1993.REMUX.2160p.mkv",
+            root / "Jurassic.Park.III.2001.REMUX.2160p.mkv",
+            root / "Jurassic.Park.The.Lost.World.1997.REMUX.2160p.mkv",
+        ]
+        self.assertFalse(is_single_tv_pack(files, root))
+
     def test_first_segments_two_shows(self) -> None:
         root = Path("/t/torrents")
         files = [
@@ -215,3 +246,33 @@ class TestPreparePackResolve(unittest.TestCase):
             ent_ep = resolve_path(ep, out, tmdb, ctx, ignore_tmdb=False)
             self.assertEqual(ent_ep.kind, "episode")
             self.assertIsNotNone(ent_ep.dest)
+
+    def test_pack_featurette_with_no_season_ancestor_defaults_to_specials(self) -> None:
+        """Firefly's Featurettes/Adam Baldwin Sings...mkv (no Season ancestor) → Specials."""
+        with tempfile.TemporaryDirectory() as td:
+            input_root = Path(td)
+            show = input_root / "Firefly (2002) Season 1 S01"
+            ep = show / "Firefly (2002) - S01E01 - Serenity.mkv"
+            extra = show / "Featurettes" / "Adam Baldwin Sings the Hero of Canton Theme.mkv"
+            ep.parent.mkdir(parents=True, exist_ok=True)
+            extra.parent.mkdir(parents=True, exist_ok=True)
+            ep.write_bytes(b"")
+            extra.write_bytes(b"")
+
+            tmdb = MagicMock()
+            tmdb.search_tv.return_value = [
+                {"id": 1437, "name": "Firefly", "first_air_date": "2002-09-20", "overview": ""},
+            ]
+            tmdb.tv_detail.return_value = {"name": "Firefly", "original_name": "Firefly"}
+
+            ctx = PlanContext(all_files=[ep, extra], input_root=input_root)
+            prepare_pack_tv_resolve(ctx, tmdb, input_root)
+            self.assertIn(show.resolve(), ctx.entity_packs)
+
+            out = Path(td) / "out"
+            entry = resolve_path(extra, out, tmdb, ctx, ignore_tmdb=False)
+            self.assertEqual(entry.kind, "extra")
+            self.assertEqual(entry.season, 0)
+            self.assertIsNotNone(entry.dest)
+            self.assertIn("Specials", entry.dest.parts)
+            self.assertIn("Featurettes", entry.dest.parts)

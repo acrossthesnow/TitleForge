@@ -6,7 +6,7 @@ import os
 import re
 from pathlib import Path
 
-from titleforge.classify import guess_kind, parse_sxe
+from titleforge.classify import _S00E00, guess_kind, parse_sxe
 from titleforge.series_folder import _SEASON_DIR, is_extras_parent_name
 
 
@@ -114,7 +114,8 @@ def _root_has_tv_signals(root: Path, files: list[Path]) -> bool:
 def is_single_tv_pack(files: list[Path], root: Path) -> bool:
     """
     True when all files live under ``root`` and the tree looks like one TV pack
-    (season folders and/or extras parents), not multiple top-level show folders.
+    (season folders, extras parents, and/or loose SxxEyy episode files at the root),
+    not multiple top-level show folders.
     """
     if len(files) < 1:
         return False
@@ -129,9 +130,15 @@ def is_single_tv_pack(files: list[Path], root: Path) -> bool:
         return _root_has_tv_signals(root, files)
     if len(segs) == 1:
         return _root_has_tv_signals(root, files)
+    # Allow loose SxxEyy filenames at the root alongside Season/Extras dirs (Firefly layout).
     for s in segs:
-        if not (_SEASON_DIR.match(s) or is_extras_parent_name(s)):
-            return False
+        if _SEASON_DIR.match(s):
+            continue
+        if is_extras_parent_name(s):
+            continue
+        if _S00E00.search(s):
+            continue
+        return False
     return True
 
 

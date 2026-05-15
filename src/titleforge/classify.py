@@ -14,8 +14,19 @@ _SE_WORDS = re.compile(
 )
 _EP_PREFIX = re.compile(r"(?i)\bEp\.?\s*(\d{1,4})\b")
 
-# Movie year at end of stem: Title (2009)
-_NAME_YEAR = re.compile(r"(.+?)\s*\(((?:19|20)\d{2})\)\s*$")
+# Movie year at end of stem: Title (2009), optionally followed by [tag] groups.
+_NAME_YEAR = re.compile(r"(.+?)\s*\(((?:19|20)\d{2})\)\s*(?:\[[^\]]*\]\s*)*$")
+# Scene-style: Title.YYYY.release-tail. Requires a release token in the tail so
+# `Show 2020 S01E01` doesn't get classified as a movie (looks_episode wins anyway
+# because parse_sxe matches first, but defending against false positives here).
+_NAME_DOT_YEAR = re.compile(
+    r"^(?P<t>.+?)[.\s_-]+(?P<y>(?:19|20)\d{2})[.\s_-]+(?P<rest>.+)$"
+)
+_RELEASE_TAIL = re.compile(
+    r"(?i)\b(720p|1080p|2160p|4k|web-?dl|webrip|bluray|bdrip|brrip|dvdrip|hdtv|"
+    r"remux|extended|unrated|repack|proper|multi|x264|x265|hevc|h\.?264|h\.?265|"
+    r"av1|hdr\d*|sdr|uhd|dv|truehd|atmos|dts|aac\d*|ac3|eac3|ddp?\d|imax)\b"
+)
 
 # Optional dated episode YYYY-MM-DD (simple)
 _DATE_EP = re.compile(r"(?i)\b(19|20)\d{2}[.\-_](0[1-9]|1[0-2])[.\-_](0[1-9]|[12]\d|3[01])\b")
@@ -51,6 +62,9 @@ def looks_movie(path: Path) -> bool:
         return False
     stem = path.stem.strip()
     if _NAME_YEAR.match(stem):
+        return True
+    m = _NAME_DOT_YEAR.match(stem)
+    if m and _RELEASE_TAIL.search(m.group("rest")):
         return True
     return False
 

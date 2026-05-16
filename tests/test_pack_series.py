@@ -276,3 +276,39 @@ class TestPreparePackResolve(unittest.TestCase):
             self.assertIsNotNone(entry.dest)
             self.assertIn("Specials", entry.dest.parts)
             self.assertIn("Featurettes", entry.dest.parts)
+
+    def test_extras_with_sxxeyy_in_filename_route_as_season_extras(self) -> None:
+        """Firefly/Featurettes/Deleted Scenes/S01E01 Serenity - Scene 1.mkv:
+        SxxEyy in the filename must NOT route to resolve_episode (which would
+        re-search TMDB for the parent folder name "Deleted Scenes"). Under an
+        extras container, the file is a season extra: season comes from SxxEyy."""
+        with tempfile.TemporaryDirectory() as td:
+            input_root = Path(td)
+            show = input_root / "Firefly (2002) Season 1 S01"
+            ep = show / "Firefly (2002) - S01E01 - Serenity.mkv"
+            scene = show / "Featurettes" / "Deleted Scenes" / "S01E01 Serenity - Scene 1.mkv"
+            ep.parent.mkdir(parents=True, exist_ok=True)
+            scene.parent.mkdir(parents=True, exist_ok=True)
+            ep.write_bytes(b"")
+            scene.write_bytes(b"")
+
+            tmdb = MagicMock()
+            tmdb.search_tv.return_value = [
+                {"id": 1437, "name": "Firefly", "first_air_date": "2002-09-20", "overview": ""},
+            ]
+            tmdb.tv_detail.return_value = {"name": "Firefly", "original_name": "Firefly"}
+
+            ctx = PlanContext(all_files=[ep, scene], input_root=input_root)
+            prepare_pack_tv_resolve(ctx, tmdb, input_root)
+
+            out = Path(td) / "out"
+            entry = resolve_path(scene, out, tmdb, ctx, ignore_tmdb=False)
+            # Must be a season extra (no re-search for "Deleted Scenes")
+            self.assertEqual(entry.kind, "extra")
+            self.assertEqual(entry.season, 1)
+            self.assertIsNotNone(entry.dest)
+            self.assertIn("Season 01", entry.dest.parts)
+            self.assertIn("Deleted Scenes", entry.dest.parts)
+            # And critically: the binder did NOT re-search TMDB after the
+            # initial pack-TV pick (which already returned in prepare_pack_tv_resolve).
+            self.assertEqual(tmdb.search_tv.call_count, 1)

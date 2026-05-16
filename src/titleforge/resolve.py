@@ -167,16 +167,19 @@ def prepare_pack_tv_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root: Path
             description=_tmdb_overview,
             filename_year=cleaned.year,
             extract_year=_year_from_tv_search_row,
+            quiet=True,
         )
         if pick is None:
             continue
         tv_id = int(pick["id"])
         detail = tmdb.tv_detail(tv_id)
         series_name = detail.get("name") or detail.get("original_name") or "Series"
+        first_air = detail.get("first_air_date") or ""
+        tv_year = first_air[:4] if len(first_air) >= 4 and first_air[:4].isdigit() else None
         er = entity.resolve()
         ctx.entity_packs[er] = (tv_id, series_name)
         ctx.series_by_root[er] = (tv_id, series_name)
-        _user_notice(entity, f"Pack TV bound: {series_name} {{tmdb-{tv_id}}}")
+        _entity_decision_notice("TV", series_name, tv_year, tv_id, entity)
 
 
 _COLLECTION_HINT = re.compile(r"(?i)\b(collection|trilogy|anthology|saga|box\s*set|complete)\b")
@@ -241,6 +244,7 @@ def prepare_movie_entity_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root:
             description=_tmdb_overview,
             filename_year=year,
             extract_year=_year_from_movie_search_row,
+            quiet=True,
         )
         if pick is None:
             continue
@@ -251,7 +255,7 @@ def prepare_movie_entity_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root:
         ctx.entity_movies[er] = MovieEntityBinding(
             tmdb_movie_id=mid, title=full_title, year=full_year
         )
-        _user_notice(entity, f"Movie folder bound: {full_title} ({full_year}) {{tmdb-{mid}}}")
+        _entity_decision_notice("MOVIE", full_title, full_year, mid, entity)
 
 
 def _bind_movie_entity_from_query(
@@ -294,6 +298,7 @@ def _bind_movie_entity_from_query(
         description=_tmdb_overview,
         filename_year=year,
         extract_year=_year_from_movie_search_row,
+        quiet=True,
     )
     if pick is None:
         _user_notice(entity, "Pack TV → movie search cancelled; member files will resolve individually.")
@@ -305,7 +310,7 @@ def _bind_movie_entity_from_query(
     ctx.entity_movies[entity.resolve()] = MovieEntityBinding(
         tmdb_movie_id=mid, title=full_title, year=full_year
     )
-    _user_notice(entity, f"Pack TV → movie folder bound: {full_title} ({full_year}) {{tmdb-{mid}}}")
+    _entity_decision_notice("MOVIE", full_title, full_year, mid, entity)
 
 
 def resolve_movie_entity_member(
@@ -354,13 +359,44 @@ def resolve_pack_tv_member(
         return PlanEntry(src=path, dest=None, kind="skipped", note="Pack context incomplete")
     tv_id, series_name = packed
 
+    # Files under an extras container (Featurettes/, Deleted Scenes/, …) are Plex
+    # season extras — even if the filename contains SxxEyy. SxxEyy in an extras
+    # file names the *episode the extra belongs to*, not "this is that episode".
+    # This MUST run before the looks_episode check below; otherwise a Deleted
+    # Scenes/S01E01 Scene 1.mkv falls through to resolve_episode, which then
+    # re-searches TMDB for the parent folder name ("Deleted Scenes").
+    if _is_under_extras_container(path, entity):
+        season = infer_season_from_path_ancestors(path, entity)
+        if season is None:
+            sxe = parse_sxe(path)
+            season = sxe[0] if sxe is not None else 0
+        title = strip_release_info(path.stem, aggressive=True) or path.stem
+        extra_cat = infer_plex_extra_folder(path, entity_root=entity)
+        dest = build_season_extra_dest(
+            output_root,
+            series_name,
+            season,
+            path,
+            tmdb_tv_id=tv_id,
+            display_title=title,
+            plex_extra_folder=extra_cat,
+        )
+        return PlanEntry(
+            src=path,
+            dest=dest,
+            kind="extra",
+            tmdb_tv_id=tv_id,
+            season=season,
+            episode=None,
+            note=f"pack extra ({extra_cat})",
+        )
+
+    # Real episode under the bound show — finalize with the pack binding directly
+    # to avoid the redundant TMDB show search that resolve_episode would do.
     if looks_episode(path) or guess_kind(path) == "episode":
-        return resolve_episode(path, output_root, tmdb, ctx)
+        return _finalize_episode(path, output_root, tmdb, ctx, tv_id, series_name)
 
     season = infer_season_from_path_ancestors(path, entity)
-    if season is None and _is_under_extras_container(path, entity):
-        # Featurettes/foo.mkv with no Season ancestor → Plex Specials extras.
-        season = 0
     if season is not None:
         title = strip_release_info(path.stem, aggressive=True) or path.stem
         extra_cat = infer_plex_extra_folder(path, entity_root=entity)
@@ -472,6 +508,27 @@ def _user_notice(path: Path | None, message: str) -> None:
     print(f"TitleForge{tag}: {message}", file=sys.stderr, flush=True)
 
 
+def _entity_decision_notice(
+    kind: str,
+    title: str,
+    year: int | str | None,
+    tmdb_id: int,
+    entity: Path,
+) -> None:
+    """Single consolidated decision line per entity binding: `[KIND] Title (Year) {tmdb-id}`.
+
+    Intentionally terse — replaces the previous two-line "Auto-selected best …" +
+    "Bound: …" pair so confident picks scroll cleanly. The entity folder name is
+    still surfaced via the `[name]` tag for traceability.
+    """
+    y = f" ({year})" if year else ""
+    print(
+        f"TitleForge [{entity.name}]: [{kind}] {title}{y} {{tmdb-{tmdb_id}}}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 TPick = TypeVar("TPick")
 
 
@@ -489,11 +546,15 @@ def _auto_pick_or_select(
     description: Callable[[TPick], str | None] | None = None,
     filename_year: int | None = None,
     extract_year: Callable[[TPick], int | None] | None = None,
+    quiet: bool = False,
 ) -> TPick | None:
+    """When ``quiet=True``, suppress the auto-pick reason notices (caller is
+    expected to emit a single consolidated decision line after binding)."""
     if not items:
         return None
     if len(items) == 1:
-        _user_notice(header_path, f"Only one TMDB match — using: {label(items[0])}")
+        if not quiet:
+            _user_notice(header_path, f"Only one TMDB match — using: {label(items[0])}")
         return items[0]
     if (
         filename_year is not None
@@ -502,10 +563,11 @@ def _auto_pick_or_select(
     ):
         matches = [it for it in items if extract_year(it) == filename_year]
         if len(matches) == 1:
-            _user_notice(
-                header_path,
-                f"Single TMDB match for file year {filename_year} — using: {label(matches[0])}",
-            )
+            if not quiet:
+                _user_notice(
+                    header_path,
+                    f"Single TMDB match for file year {filename_year} — using: {label(matches[0])}",
+                )
             return matches[0]
     q = query.lower()
     scored = sorted(
@@ -521,15 +583,17 @@ def _auto_pick_or_select(
         else 0.0
     )
     if best_s >= 0.62 and (best_s - second_s) >= 0.07:
+        if not quiet:
+            _user_notice(
+                header_path,
+                f"Auto-selected best TMDB title match (score {best_s:.2f}): {label(best)}",
+            )
+        return best
+    if not quiet:
         _user_notice(
             header_path,
-            f"Auto-selected best TMDB title match (score {best_s:.2f}): {label(best)}",
+            f"TMDB returned {len(scored)} close candidate(s); choose in the menu ({title}).",
         )
-        return best
-    _user_notice(
-        header_path,
-        f"TMDB returned {len(scored)} close candidate(s); choose in the menu ({title}).",
-    )
     body = select_message or title
     if header_path is not None:
         clear_tty()

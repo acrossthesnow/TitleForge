@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib.metadata
+import sys
 from pathlib import Path
 
 import typer
 
+from titleforge.cleanup import remove_empty_source_dirs
 from titleforge.config import ensure_tmdb_credentials_interactive, get_tmdb_api_key, load_dotenv_sources
 from titleforge.discover import discover_videos
 from titleforge.resolve import build_plan
@@ -63,6 +65,15 @@ def main(
         "--auto-approve",
         help="Skip the Phase 1.5 search-review UI (useful for scripted runs).",
     ),
+    cleanup: bool | None = typer.Option(
+        None,
+        "--cleanup/--no-cleanup",
+        help=(
+            "After successful moves, remove source subdirectories that contain "
+            "no real videos (sample/junk leftovers are ignored). If neither "
+            "--cleanup nor --no-cleanup is given, you'll be prompted at the end."
+        ),
+    ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
@@ -101,6 +112,7 @@ def main(
         outcome = run_review(plan, output_dir)
         if outcome == "proceed":
             typer.secho("Moves completed.", fg=typer.colors.GREEN)
+            _maybe_cleanup_source(input_dir, cleanup)
         else:
             typer.secho("Cancelled — no files were moved.", fg=typer.colors.YELLOW)
     except KeyboardInterrupt:
@@ -108,6 +120,39 @@ def main(
         raise typer.Exit(130) from None
     finally:
         tmdb.close()
+
+
+def _maybe_cleanup_source(input_dir: Path, cleanup: bool | None) -> None:
+    """Apply the --cleanup tri-state policy.
+
+    - ``True`` / ``False``: act / skip without prompting.
+    - ``None``: prompt the user; non-interactive runs default to skip so
+      scripted invocations stay safe.
+    """
+    do_cleanup: bool
+    if cleanup is True:
+        do_cleanup = True
+    elif cleanup is False:
+        do_cleanup = False
+    elif sys.stdin.isatty() and sys.stdout.isatty():
+        do_cleanup = typer.confirm(
+            "Remove empty source directories (no real videos remain)?",
+            default=False,
+        )
+    else:
+        # No flag, no TTY → safest is to leave the inbox alone.
+        do_cleanup = False
+
+    if not do_cleanup:
+        return
+
+    removed = remove_empty_source_dirs(input_dir)
+    if not removed:
+        typer.secho("Cleanup: no empty source directories to remove.", fg=typer.colors.CYAN)
+        return
+    typer.secho(f"Cleanup: removed {len(removed)} source director{'y' if len(removed) == 1 else 'ies'}:", fg=typer.colors.CYAN)
+    for d in removed:
+        typer.echo(f"  - {d}")
 
 
 def run_cli() -> None:

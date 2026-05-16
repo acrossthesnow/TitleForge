@@ -9,6 +9,7 @@ from titleforge.config import ensure_tmdb_credentials_interactive, get_tmdb_api_
 from titleforge.discover import discover_videos
 from titleforge.resolve import build_plan
 from titleforge.review_app import run_review
+from titleforge.search_review_app import run_search_review
 from titleforge.tmdb_client import TmdbClient
 from titleforge.tmdb_errors import TmdbAuthError
 
@@ -57,6 +58,11 @@ def main(
         "--ignore-tmdb",
         help="Re-resolve with TMDB even when the source path already contains a {tmdb-<id>} folder tag.",
     ),
+    auto_approve: bool = typer.Option(
+        False,
+        "--auto-approve",
+        help="Skip the Phase 1.5 search-review UI (useful for scripted runs).",
+    ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
@@ -85,7 +91,13 @@ def main(
         except TmdbAuthError as e:
             typer.secho(str(e), fg=typer.colors.RED, err=True)
             raise typer.Exit(1) from None
-        typer.echo("Opening review…")
+        if not auto_approve:
+            typer.echo("Opening search review (Phase 1.5)…")
+            search_outcome = run_search_review(plan, output_dir, tmdb)
+            if search_outcome != "proceed":
+                typer.secho("Cancelled at search review — no files were moved.", fg=typer.colors.YELLOW)
+                raise typer.Exit(1) from None
+        typer.echo("Opening file-move review (Phase 2)…")
         outcome = run_review(plan, output_dir)
         if outcome == "proceed":
             typer.secho("Moves completed.", fg=typer.colors.GREEN)

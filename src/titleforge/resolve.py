@@ -13,7 +13,7 @@ from questionary import Style
 
 from titleforge.classify import guess_kind, looks_episode, looks_movie, parse_sxe, series_query_string
 from titleforge.extra_category import infer_plex_extra_folder
-from titleforge.models import PlanEntry, RenamePlan
+from titleforge.models import ConfidenceLevel, EntityLabel, PlanEntry, RenamePlan
 from titleforge.nfo import collect_ids_near_video
 from titleforge.normalize import basename_terms, parent_folder_term, strip_release_info
 from titleforge.pack import (
@@ -38,12 +38,41 @@ from titleforge.tmdb_errors import TmdbAuthError
 
 
 @dataclass
+class _PerFileLabel:
+    """Confidence + candidates harvested per per-file resolution, consumed when
+    building the final EntityLabel list. Internal to resolve.py."""
+
+    kind: Literal["movie", "tv", "skipped"]
+    tmdb_id: int | None
+    title: str
+    year: int | None
+    confidence: ConfidenceLevel
+    reason: str
+    candidates: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class PackTvBinding:
+    """One TMDB show pick bound to a top-level entity folder (pack-TV pre-resolve)."""
+
+    tmdb_tv_id: int
+    series_name: str
+    year: int | None
+    confidence: ConfidenceLevel
+    reason: str
+    candidates: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
 class MovieEntityBinding:
     """One TMDB movie pick bound to a top-level entity folder (movie-folder pre-resolve)."""
 
     tmdb_movie_id: int
     title: str
     year: int | None
+    confidence: ConfidenceLevel
+    reason: str
+    candidates: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -53,10 +82,15 @@ class PlanContext:
     season_cache: dict[tuple[int, int], dict[str, Any]] = field(default_factory=dict)
     # Resolved ``--input``; pack TV binds only per first-level folder beneath it.
     input_root: Path | None = None
-    # Top-level entity dir -> (tmdb_tv_id, series_name) from one pack pick per folder.
-    entity_packs: dict[Path, tuple[int, str]] = field(default_factory=dict)
+    # Top-level entity dir -> PackTvBinding from one pack pick per folder.
+    entity_packs: dict[Path, PackTvBinding] = field(default_factory=dict)
     # Top-level entity dir -> single TMDB movie bound for the folder.
     entity_movies: dict[Path, MovieEntityBinding] = field(default_factory=dict)
+    # Per-PlanEntry confidence/reason/candidates, keyed by source path. Populated
+    # by the silent resolvers and harvested into EntityLabels at the end of
+    # build_plan(). Avoids growing PlanEntry's surface area when the data is
+    # really only needed for the search-review UI.
+    per_file_label: dict[Path, "_PerFileLabel"] = field(default_factory=dict)
 
     def get_season_json(self, tmdb: TmdbClient, tv_id: int, season: int) -> dict[str, Any]:
         key = (tv_id, season)
@@ -117,67 +151,39 @@ def prepare_pack_tv_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root: Path
         y_note = f" (year filter {cleaned.year})" if cleaned.year else ""
         pack_label = query
         if not results:
+            # Phase 1 is silent — defer to the Phase 1.5 search-review UI where
+            # the user can drop into prompt_search_with_type via the edit action.
             _user_notice(
                 entity,
-                f"Pack TV search: no results for folder name {query!r}{y_note}; enter a show title below.",
-            )
-            res = prompt_search_with_type(
-                "Pack TV search: enter show title:",
-                default=query,
-                initial_type="tv",
-            )
-            if res is None:
-                continue
-            pack_search_type, pack_label = res
-            if pack_search_type == "movie":
-                # User says this isn't a TV pack — try the typed query as a movie
-                # folder binding right now so the decision is visible (not silently
-                # deferred to per-file resolution where the original folder name
-                # gets re-searched instead of what they typed).
-                _bind_movie_entity_from_query(ctx, tmdb, entity, pack_label, cleaned.year)
-                continue
-            if pack_search_type == "both":
-                _user_notice(
-                    entity,
-                    f"Pack TV search: type switched to 'both'; skipping pack binding for this "
-                    f"folder. Member files will resolve individually using query {pack_label!r}.",
-                )
-                continue
-            try:
-                results = _dedupe_tv(tmdb.search_tv(pack_label, cleaned.year))
-            except TmdbAuthError:
-                raise
-            except Exception:
-                continue
-        if not results:
-            _user_notice(
-                entity,
-                f"Pack TV search: still no results for {pack_label!r}{y_note}; skipping pack for this folder.",
+                f"Pack TV search: no results for {pack_label!r}{y_note}; "
+                "files will resolve individually (review in Phase 1.5).",
             )
             continue
-        pick = _auto_pick_or_select(
-            "Select TV series (pack)",
+        picked = _auto_pick(
             results,
-            _tv_label,
             pack_label.lower(),
             lambda m: (m.get("name") or m.get("original_name") or ""),
-            header_path=entity,
-            style=LIST_STYLE,
-            use_indicator=True,
-            description=_tmdb_overview,
             filename_year=cleaned.year,
             extract_year=_year_from_tv_search_row,
-            quiet=True,
         )
-        if pick is None:
+        if picked is None:
             continue
+        pick, confidence, reason, candidates = picked
         tv_id = int(pick["id"])
         detail = tmdb.tv_detail(tv_id)
         series_name = detail.get("name") or detail.get("original_name") or "Series"
         first_air = detail.get("first_air_date") or ""
-        tv_year = first_air[:4] if len(first_air) >= 4 and first_air[:4].isdigit() else None
+        tv_year_str = first_air[:4] if len(first_air) >= 4 and first_air[:4].isdigit() else ""
+        tv_year = int(tv_year_str) if tv_year_str else None
         er = entity.resolve()
-        ctx.entity_packs[er] = (tv_id, series_name)
+        ctx.entity_packs[er] = PackTvBinding(
+            tmdb_tv_id=tv_id,
+            series_name=series_name,
+            year=tv_year,
+            confidence=confidence,
+            reason=reason,
+            candidates=candidates,
+        )
         ctx.series_by_root[er] = (tv_id, series_name)
         _entity_decision_notice("TV", series_name, tv_year, tv_id, entity)
 
@@ -232,28 +238,27 @@ def prepare_movie_entity_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root:
         if not results:
             _user_notice(entity, f"Movie folder search: no TMDB hits for {title!r} ({year}); files will resolve individually.")
             continue
-        pick = _auto_pick_or_select(
-            "Select movie (folder)",
+        picked = _auto_pick(
             results,
-            _movie_label,
             title.lower(),
             lambda m: (m.get("title") or m.get("original_title") or ""),
-            header_path=entity,
-            style=LIST_STYLE,
-            use_indicator=True,
-            description=_tmdb_overview,
             filename_year=year,
             extract_year=_year_from_movie_search_row,
-            quiet=True,
         )
-        if pick is None:
+        if picked is None:
             continue
+        pick, confidence, reason, candidates = picked
         mid = int(pick["id"])
         detail = tmdb.movie_detail(mid)
         full_title = detail.get("title") or detail.get("original_title") or title
         full_year = _year_from_movie(detail) or year
         ctx.entity_movies[er] = MovieEntityBinding(
-            tmdb_movie_id=mid, title=full_title, year=full_year
+            tmdb_movie_id=mid,
+            title=full_title,
+            year=full_year,
+            confidence=confidence,
+            reason=reason,
+            candidates=candidates,
         )
         _entity_decision_notice("MOVIE", full_title, full_year, mid, entity)
 
@@ -286,29 +291,28 @@ def _bind_movie_entity_from_query(
             "member files will resolve individually.",
         )
         return
-    pick = _auto_pick_or_select(
-        "Select movie (folder)",
+    picked = _auto_pick(
         results,
-        _movie_label,
         query.lower(),
         lambda m: (m.get("title") or m.get("original_title") or ""),
-        header_path=entity,
-        style=LIST_STYLE,
-        use_indicator=True,
-        description=_tmdb_overview,
         filename_year=year,
         extract_year=_year_from_movie_search_row,
-        quiet=True,
     )
-    if pick is None:
+    if picked is None:
         _user_notice(entity, "Pack TV → movie search cancelled; member files will resolve individually.")
         return
+    pick, confidence, reason, candidates = picked
     mid = int(pick["id"])
     detail = tmdb.movie_detail(mid)
     full_title = detail.get("title") or detail.get("original_title") or query
     full_year = _year_from_movie(detail) or year
     ctx.entity_movies[entity.resolve()] = MovieEntityBinding(
-        tmdb_movie_id=mid, title=full_title, year=full_year
+        tmdb_movie_id=mid,
+        title=full_title,
+        year=full_year,
+        confidence=confidence,
+        reason=reason,
+        candidates=candidates,
     )
     _entity_decision_notice("MOVIE", full_title, full_year, mid, entity)
 
@@ -357,7 +361,7 @@ def resolve_pack_tv_member(
     packed = ctx.entity_packs.get(entity.resolve())
     if packed is None:
         return PlanEntry(src=path, dest=None, kind="skipped", note="Pack context incomplete")
-    tv_id, series_name = packed
+    tv_id, series_name = packed.tmdb_tv_id, packed.series_name
 
     # Files under an extras container (Featurettes/, Deleted Scenes/, …) are Plex
     # season extras — even if the filename contains SxxEyy. SxxEyy in an extras
@@ -531,31 +535,38 @@ def _entity_decision_notice(
 
 TPick = TypeVar("TPick")
 
+# Silence the no-longer-used inline-picker kwargs from old callsites without
+# renaming the function. Phase 1 is silent now — UI happens in search_review_app.
+_UnusedPickerKw = Any
 
-def _auto_pick_or_select(
-    title: str,
+
+def _auto_pick(
     items: list[TPick],
-    label: Callable[[TPick], str],
     query: str,
     key_fn: Callable[[TPick], str],
     *,
-    header_path: Path | None = None,
-    select_message: str | None = None,
-    style: Style | None = None,
-    use_indicator: bool = False,
-    description: Callable[[TPick], str | None] | None = None,
     filename_year: int | None = None,
     extract_year: Callable[[TPick], int | None] | None = None,
-    quiet: bool = False,
-) -> TPick | None:
-    """When ``quiet=True``, suppress the auto-pick reason notices (caller is
-    expected to emit a single consolidated decision line after binding)."""
+    max_candidates: int = 15,
+) -> tuple[TPick, ConfidenceLevel, str, list[TPick]] | None:
+    """Silent auto-pick — never prompts.
+
+    Returns ``(pick, confidence, reason, top_candidates)`` or ``None`` if the
+    list is empty. The decision is one of:
+
+    - **high**, "single TMDB hit" — one result.
+    - **high**, "single year match (YYYY)" — exactly one result matches the
+      filename's year hint.
+    - **medium**, "similarity X.XX (Δ Y.YY)" — top similarity score ≥ 0.62 and
+      beats runner-up by ≥ 0.07.
+    - **low**, "ambiguous (N candidates, top X.XX)" — no decisive winner; the
+      top result is returned anyway and the candidate list is preserved so
+      the user can flip the pick in the search-review UI.
+    """
     if not items:
         return None
     if len(items) == 1:
-        if not quiet:
-            _user_notice(header_path, f"Only one TMDB match — using: {label(items[0])}")
-        return items[0]
+        return items[0], "high", "single TMDB hit", list(items)
     if (
         filename_year is not None
         and filename_year > 0
@@ -563,12 +574,12 @@ def _auto_pick_or_select(
     ):
         matches = [it for it in items if extract_year(it) == filename_year]
         if len(matches) == 1:
-            if not quiet:
-                _user_notice(
-                    header_path,
-                    f"Single TMDB match for file year {filename_year} — using: {label(matches[0])}",
-                )
-            return matches[0]
+            return (
+                matches[0],
+                "high",
+                f"single year match ({filename_year})",
+                list(items),
+            )
     q = query.lower()
     scored = sorted(
         items,
@@ -582,44 +593,56 @@ def _auto_pick_or_select(
         if len(scored) > 1
         else 0.0
     )
+    candidates = scored[:max_candidates]
     if best_s >= 0.62 and (best_s - second_s) >= 0.07:
-        if not quiet:
-            _user_notice(
-                header_path,
-                f"Auto-selected best TMDB title match (score {best_s:.2f}): {label(best)}",
-            )
-        return best
-    if not quiet:
-        _user_notice(
-            header_path,
-            f"TMDB returned {len(scored)} close candidate(s); choose in the menu ({title}).",
+        return (
+            best,
+            "medium",
+            f"similarity {best_s:.2f} (Δ {best_s - second_s:.2f})",
+            candidates,
         )
-    body = select_message or title
-    if header_path is not None:
-        clear_tty()
-        # Plain text only — raw ANSI in this string is shown literally by prompt_toolkit.
-        prompt = f"{header_path.stem}\n{body}"
-    else:
-        prompt = body
-    sel_kw: dict[str, Any] = {}
-    if style is not None:
-        sel_kw["style"] = style
-    if use_indicator:
-        sel_kw["use_indicator"] = True
-    if description is not None:
-        sel_kw["show_description"] = True
-    choices: list[questionary.Choice] = []
-    for it in scored[:15]:
-        if description is not None:
-            desc = description(it)
-            if desc:
-                choices.append(questionary.Choice(label(it), it, description=desc))
-            else:
-                choices.append(questionary.Choice(label(it), it))
-        else:
-            choices.append(questionary.Choice(label(it), it))
-    choice = questionary.select(prompt, choices=choices, **sel_kw).unsafe_ask(patch_stdout=True)
-    return choice
+    return (
+        best,
+        "low",
+        f"ambiguous ({len(scored)} candidates, top {best_s:.2f})",
+        candidates,
+    )
+
+
+def _auto_pick_or_select(
+    title: str,
+    items: list[TPick],
+    label: Callable[[TPick], str],
+    query: str,
+    key_fn: Callable[[TPick], str],
+    *,
+    header_path: Path | None = None,
+    filename_year: int | None = None,
+    extract_year: Callable[[TPick], int | None] | None = None,
+    quiet: bool = False,
+    # Accepted-but-ignored kwargs from the old interactive picker. Phase 1 is
+    # silent; menus/styles only apply in the search-review UI now.
+    select_message: _UnusedPickerKw = None,
+    style: _UnusedPickerKw = None,
+    use_indicator: _UnusedPickerKw = False,
+    description: _UnusedPickerKw = None,
+) -> TPick | None:
+    """Backwards-compat shim wrapping :func:`_auto_pick`. Returns only the pick;
+    confidence/reason are dropped at this boundary. New code should call
+    :func:`_auto_pick` directly so the metadata reaches the search-review UI."""
+    result = _auto_pick(
+        items,
+        query,
+        key_fn,
+        filename_year=filename_year,
+        extract_year=extract_year,
+    )
+    if result is None:
+        return None
+    pick, conf, reason, _candidates = result
+    if not quiet and header_path is not None:
+        _user_notice(header_path, f"[{conf}] {reason}: {label(pick)}")
+    return pick
 
 
 TaggedHit = tuple[Literal["movie", "tv"], dict[str, Any]]
@@ -676,66 +699,33 @@ def resolve_ambiguous_dual(
     cleaned = clean_stem_for_search(path.stem)
     q0 = cleaned.title or cleaned.raw_stem or path.stem
     y_note = f" (year filter {cleaned.year})" if cleaned.year else ""
-    search_label = q0
     candidates = _gather_dual_candidates(tmdb, cleaned)
     if not candidates:
         _user_notice(
             path,
-            f"No TMDB movie or TV results for {q0!r}{y_note}; enter a different search title below.",
+            f"No TMDB movie or TV results for {q0!r}{y_note}; file marked for review in Phase 1.5.",
         )
-        res = prompt_search_with_type(
-            "No TMDB movie or TV hits. Enter search title:",
-            default=cleaned.title or cleaned.raw_stem,
-            initial_type="both",
-        )
-        if res is None:
-            return PlanEntry(src=path, dest=None, kind="skipped", note="No dual-search query")
-        dual_type, search_label = res
-        if dual_type != "both":
-            return _manual_dispatch(
-                search_type=dual_type,
-                query=search_label,
-                year=cleaned.year,
-                path=path,
-                output_root=output_root,
-                tmdb=tmdb,
-                ctx=ctx,
-            )
-        candidates = _gather_dual_candidates(
-            tmdb,
-            CleanedQuery(title=search_label, year=cleaned.year, raw_stem=cleaned.raw_stem, stripped_year_note=cleaned.stripped_year_note),
-            manual_query=search_label,
-        )
-    if not candidates:
-        _user_notice(
-            path,
-            f"Still no TMDB results for {search_label!r}{y_note}; skipping this file.",
+        ctx.per_file_label[path] = _PerFileLabel(
+            kind="skipped",
+            tmdb_id=None,
+            title=q0,
+            year=cleaned.year,
+            confidence="low",
+            reason=f"no TMDB hits for {q0!r}{y_note}",
         )
         return PlanEntry(src=path, dest=None, kind="skipped", note="No TMDB results")
 
-    nm = sum(1 for k, _ in candidates if k == "movie")
-    nt = sum(1 for k, _ in candidates if k == "tv")
-    _user_notice(
-        path,
-        f"TMDB dual search: {nm} movie(s), {nt} TV show(s) for {search_label!r}{y_note}.",
-    )
-
     query_key = (cleaned.title or cleaned.raw_stem).lower()
-    pick = _auto_pick_or_select(
-        "Select movie or TV match",
+    picked = _auto_pick(
         candidates,
-        _dual_choice_label,
         query_key,
         _dual_key_fn,
-        header_path=path,
-        style=LIST_STYLE,
-        use_indicator=True,
-        description=lambda hit: _tmdb_overview(hit[1]),
         filename_year=cleaned.year,
         extract_year=_year_from_tagged_hit,
     )
-    if pick is None:
-        return PlanEntry(src=path, dest=None, kind="skipped", note="Cancelled dual pick")
+    if picked is None:
+        return PlanEntry(src=path, dest=None, kind="skipped", note="No dual candidates")
+    pick, confidence, reason, top_candidates = picked
 
     kind, row = pick
     if kind == "movie":
@@ -744,6 +734,15 @@ def resolve_ambiguous_dual(
         title = detail.get("title") or detail.get("original_title") or "Unknown"
         y = _year_from_movie(detail)
         dest = build_movie_dest(output_root, title, y, path, tmdb_movie_id=mid)
+        ctx.per_file_label[path] = _PerFileLabel(
+            kind="movie",
+            tmdb_id=mid,
+            title=title,
+            year=y,
+            confidence=confidence,
+            reason=reason,
+            candidates=[r for _, r in top_candidates],
+        )
         return PlanEntry(src=path, dest=dest, kind="movie", tmdb_movie_id=mid)
 
     tv_id = int(row["id"])
@@ -752,7 +751,7 @@ def resolve_ambiguous_dual(
     root = series_group_root(path, ctx.all_files)
     if root is not None:
         ctx.series_by_root[root] = (tv_id, series_name)
-    return _finalize_episode(
+    entry = _finalize_episode(
         path,
         output_root,
         tmdb,
@@ -760,6 +759,16 @@ def resolve_ambiguous_dual(
         tv_id,
         series_name,
     )
+    ctx.per_file_label[path] = _PerFileLabel(
+        kind="tv",
+        tmdb_id=tv_id,
+        title=series_name,
+        year=_year_from_tv_search_row(row),
+        confidence=confidence,
+        reason=reason,
+        candidates=[r for _, r in top_candidates],
+    )
+    return entry
 
 
 def _finalize_episode(
@@ -839,6 +848,7 @@ def _manual_movie(
     path: Path,
     output_root: Path,
     tmdb: TmdbClient,
+    ctx: PlanContext,
 ) -> PlanEntry:
     try:
         merged = _dedupe_movies(tmdb.search_movie(query, year))
@@ -849,27 +859,39 @@ def _manual_movie(
     yh = f" (year {year})" if year else ""
     if not merged:
         _user_notice(path, f"No TMDB movie results for {query!r}{yh}; skipping.")
+        ctx.per_file_label[path] = _PerFileLabel(
+            kind="skipped",
+            tmdb_id=None,
+            title=query,
+            year=year,
+            confidence="low",
+            reason=f"no TMDB movie hits for {query!r}",
+        )
         return PlanEntry(src=path, dest=None, kind="skipped", note="No movie results")
-    pick = _auto_pick_or_select(
-        "Select movie",
+    picked = _auto_pick(
         merged,
-        _movie_label,
         query.lower().strip(),
         lambda m: (m.get("title") or m.get("original_title") or ""),
-        header_path=path,
-        style=LIST_STYLE,
-        use_indicator=True,
-        description=_tmdb_overview,
         filename_year=year,
         extract_year=_year_from_movie_search_row,
     )
-    if pick is None:
-        return PlanEntry(src=path, dest=None, kind="skipped", note="Cancelled movie pick")
+    if picked is None:
+        return PlanEntry(src=path, dest=None, kind="skipped", note="No movie candidates")
+    pick, confidence, reason, candidates = picked
     mid = int(pick["id"])
     detail = tmdb.movie_detail(mid)
     title = detail.get("title") or detail.get("original_title") or "Unknown"
     y = _year_from_movie(detail)
     dest = build_movie_dest(output_root, title, y, path, tmdb_movie_id=mid)
+    ctx.per_file_label[path] = _PerFileLabel(
+        kind="movie",
+        tmdb_id=mid,
+        title=title,
+        year=y,
+        confidence=confidence,
+        reason=reason,
+        candidates=candidates,
+    )
     return PlanEntry(src=path, dest=dest, kind="movie", tmdb_movie_id=mid)
 
 
@@ -890,28 +912,40 @@ def _manual_tv(
     yh = f" (year {year})" if year else ""
     if not results:
         _user_notice(path, f"No TMDB TV results for {query!r}{yh}; skipping.")
+        ctx.per_file_label[path] = _PerFileLabel(
+            kind="skipped",
+            tmdb_id=None,
+            title=query,
+            year=year,
+            confidence="low",
+            reason=f"no TMDB TV hits for {query!r}",
+        )
         return PlanEntry(src=path, dest=None, kind="skipped", note="No TV results")
-    pick = _auto_pick_or_select(
-        "Select TV series",
+    picked = _auto_pick(
         results,
-        _tv_label,
         query.lower().strip(),
         lambda m: (m.get("name") or m.get("original_name") or ""),
-        header_path=path,
-        style=LIST_STYLE,
-        use_indicator=True,
-        description=_tmdb_overview,
         filename_year=year,
         extract_year=_year_from_tv_search_row,
     )
-    if pick is None:
-        return PlanEntry(src=path, dest=None, kind="skipped", note="Cancelled series pick")
+    if picked is None:
+        return PlanEntry(src=path, dest=None, kind="skipped", note="No TV candidates")
+    pick, confidence, reason, candidates = picked
     tv_id = int(pick["id"])
     detail = tmdb.tv_detail(tv_id)
     series_name = detail.get("name") or detail.get("original_name") or "Series"
     root = series_group_root(path, ctx.all_files)
     if root is not None:
         ctx.series_by_root[root] = (tv_id, series_name)
+    ctx.per_file_label[path] = _PerFileLabel(
+        kind="tv",
+        tmdb_id=tv_id,
+        title=series_name,
+        year=_year_from_tv_search_row(pick),
+        confidence=confidence,
+        reason=reason,
+        candidates=candidates,
+    )
     return _finalize_episode(path, output_root, tmdb, ctx, tv_id, series_name)
 
 
@@ -931,22 +965,25 @@ def _manual_dual(
     yh = f" (year {year})" if year else ""
     if not candidates:
         _user_notice(path, f"No TMDB results for {query!r}{yh}; skipping.")
+        ctx.per_file_label[path] = _PerFileLabel(
+            kind="skipped",
+            tmdb_id=None,
+            title=query,
+            year=year,
+            confidence="low",
+            reason=f"no TMDB hits for {query!r}",
+        )
         return PlanEntry(src=path, dest=None, kind="skipped", note="No dual results")
-    pick = _auto_pick_or_select(
-        "Select movie or TV match",
+    picked = _auto_pick(
         candidates,
-        _dual_choice_label,
         query.lower().strip(),
         _dual_key_fn,
-        header_path=path,
-        style=LIST_STYLE,
-        use_indicator=True,
-        description=lambda hit: _tmdb_overview(hit[1]),
         filename_year=year,
         extract_year=_year_from_tagged_hit,
     )
-    if pick is None:
-        return PlanEntry(src=path, dest=None, kind="skipped", note="Cancelled dual pick")
+    if picked is None:
+        return PlanEntry(src=path, dest=None, kind="skipped", note="No dual candidates")
+    pick, confidence, reason, top_candidates = picked
     kind, row = pick
     if kind == "movie":
         mid = int(row["id"])
@@ -954,6 +991,15 @@ def _manual_dual(
         title = detail.get("title") or detail.get("original_title") or "Unknown"
         y = _year_from_movie(detail)
         dest = build_movie_dest(output_root, title, y, path, tmdb_movie_id=mid)
+        ctx.per_file_label[path] = _PerFileLabel(
+            kind="movie",
+            tmdb_id=mid,
+            title=title,
+            year=y,
+            confidence=confidence,
+            reason=reason,
+            candidates=[r for _, r in top_candidates],
+        )
         return PlanEntry(src=path, dest=dest, kind="movie", tmdb_movie_id=mid)
     tv_id = int(row["id"])
     detail = tmdb.tv_detail(tv_id)
@@ -961,7 +1007,17 @@ def _manual_dual(
     root = series_group_root(path, ctx.all_files)
     if root is not None:
         ctx.series_by_root[root] = (tv_id, series_name)
-    return _finalize_episode(path, output_root, tmdb, ctx, tv_id, series_name)
+    entry = _finalize_episode(path, output_root, tmdb, ctx, tv_id, series_name)
+    ctx.per_file_label[path] = _PerFileLabel(
+        kind="tv",
+        tmdb_id=tv_id,
+        title=series_name,
+        year=_year_from_tv_search_row(row),
+        confidence=confidence,
+        reason=reason,
+        candidates=[r for _, r in top_candidates],
+    )
+    return entry
 
 
 def _manual_dispatch(
@@ -974,9 +1030,9 @@ def _manual_dispatch(
     tmdb: TmdbClient,
     ctx: PlanContext,
 ) -> PlanEntry:
-    """Re-route a manual no-results prompt to the user-toggled search type."""
+    """Re-route the user-toggled search type from the Phase 1.5 edit modal."""
     if search_type == "movie":
-        return _manual_movie(query, year, path, output_root, tmdb)
+        return _manual_movie(query, year, path, output_root, tmdb, ctx)
     if search_type == "tv":
         return _manual_tv(query, year, path, output_root, tmdb, ctx)
     return _manual_dual(query, year, path, output_root, tmdb, ctx)
@@ -1043,56 +1099,44 @@ def resolve_movie(
     primary_name = cleaned.title or path.stem
     yh = f" (year hint {year_hint})" if year_hint else ""
     if not merged:
-        _user_notice(
-            path,
-            f"No TMDB movie results from automated title queries{yh}; enter a manual search below.",
+        _user_notice(path, f"No TMDB movie hits for {primary_name!r}{yh}; review in Phase 1.5.")
+        ctx.per_file_label[path] = _PerFileLabel(
+            kind="skipped",
+            tmdb_id=None,
+            title=primary_name,
+            year=year_hint,
+            confidence="low",
+            reason=f"no TMDB hits for {primary_name!r}{yh}",
         )
-        res = prompt_search_with_type(
-            "No TMDB movie hits. Enter search query:",
-            default=primary_name,
-            initial_type="movie",
-        )
-        if res is None:
-            return PlanEntry(src=path, dest=None, kind="skipped", note="No query")
-        movie_type, manual_query = res
-        if movie_type != "movie":
-            return _manual_dispatch(
-                search_type=movie_type,
-                query=manual_query,
-                year=year_hint,
-                path=path,
-                output_root=output_root,
-                tmdb=tmdb,
-                ctx=ctx,
-            )
-        merged = _dedupe_movies(tmdb.search_movie(manual_query, year_hint))
-        if not merged:
-            _user_notice(path, f"No TMDB movie results for manual query {manual_query!r}{yh}; skipping.")
-            return PlanEntry(src=path, dest=None, kind="skipped", note="No movie results")
+        return PlanEntry(src=path, dest=None, kind="skipped", note="No movie results")
 
-    # Title similarity for auto-pick / menu order: use cleaned title only. Joining raw stem +
+    # Title similarity for auto-pick: use cleaned title only. Joining raw stem +
     # extra terms (e.g. "(2001)" still in raw_stem) dilutes SequenceMatcher vs TMDB titles.
     similarity_q = re.sub(r"\s+", " ", (cleaned.title or primary_name).lower()).strip()
-    pick = _auto_pick_or_select(
-        "Select movie",
+    picked = _auto_pick(
         merged,
-        _movie_label,
         similarity_q,
         lambda m: (m.get("title") or m.get("original_title") or ""),
-        header_path=path,
-        style=LIST_STYLE,
-        use_indicator=True,
-        description=_tmdb_overview,
         filename_year=year_hint,
         extract_year=_year_from_movie_search_row,
     )
-    if pick is None:
-        return PlanEntry(src=path, dest=None, kind="skipped", note="Cancelled movie pick")
+    if picked is None:
+        return PlanEntry(src=path, dest=None, kind="skipped", note="No movie candidates")
+    pick, confidence, reason, candidates = picked
     mid = int(pick["id"])
     detail = tmdb.movie_detail(mid)
     title = detail.get("title") or detail.get("original_title") or "Unknown"
     y = _year_from_movie(detail)
     dest = build_movie_dest(output_root, title, y, path, tmdb_movie_id=mid)
+    ctx.per_file_label[path] = _PerFileLabel(
+        kind="movie",
+        tmdb_id=mid,
+        title=title,
+        year=y,
+        confidence=confidence,
+        reason=reason,
+        candidates=candidates,
+    )
     return PlanEntry(src=path, dest=dest, kind="movie", tmdb_movie_id=mid)
 
 
@@ -1124,52 +1168,27 @@ def resolve_episode(
 
         results = _dedupe_tv(results)
         if not results:
-            _user_notice(
-                path,
-                f"No TMDB TV results for show query {query!r}; enter a different title below.",
-            )
-            res = prompt_search_with_type(
-                "No TMDB TV hits. Enter show search:",
-                default=query,
-                initial_type="tv",
-            )
-            if res is None:
-                return PlanEntry(src=path, dest=None, kind="skipped", note="No show query")
-            ep_type, ep_query = res
-            if ep_type != "tv":
-                return _manual_dispatch(
-                    search_type=ep_type,
-                    query=ep_query,
-                    year=stem_cleaned.year,
-                    path=path,
-                    output_root=output_root,
-                    tmdb=tmdb,
-                    ctx=ctx,
-                )
-            query = ep_query
-            results = _dedupe_tv(tmdb.search_tv(query))
-        if not results:
-            _user_notice(
-                path,
-                f"Still no TMDB TV results for {query!r}; skipping this file.",
+            _user_notice(path, f"No TMDB TV results for {query!r}; review in Phase 1.5.")
+            ctx.per_file_label[path] = _PerFileLabel(
+                kind="skipped",
+                tmdb_id=None,
+                title=query,
+                year=stem_cleaned.year,
+                confidence="low",
+                reason=f"no TMDB TV hits for {query!r}",
             )
             return PlanEntry(src=path, dest=None, kind="skipped", note="No TV results")
 
-        pick = _auto_pick_or_select(
-            "Select TV series",
+        picked = _auto_pick(
             results,
-            _tv_label,
             query.lower(),
             lambda m: (m.get("name") or m.get("original_name") or ""),
-            header_path=path,
-            style=LIST_STYLE,
-            use_indicator=True,
-            description=_tmdb_overview,
             filename_year=stem_cleaned.year,
             extract_year=_year_from_tv_search_row,
         )
-        if pick is None:
-            return PlanEntry(src=path, dest=None, kind="skipped", note="Cancelled series pick")
+        if picked is None:
+            return PlanEntry(src=path, dest=None, kind="skipped", note="No TV candidates")
+        pick, confidence, reason, candidates = picked
 
         tv_id = int(pick["id"])
         detail = tmdb.tv_detail(tv_id)
@@ -1177,6 +1196,15 @@ def resolve_episode(
         resolved_tv = (tv_id, series_name)
         if root is not None:
             ctx.series_by_root[root] = resolved_tv
+        ctx.per_file_label[path] = _PerFileLabel(
+            kind="tv",
+            tmdb_id=tv_id,
+            title=series_name,
+            year=_year_from_tv_search_row(pick),
+            confidence=confidence,
+            reason=reason,
+            candidates=candidates,
+        )
 
     assert resolved_tv is not None
     tv_id, series_name = resolved_tv
@@ -1214,18 +1242,25 @@ def resolve_path(
     if ctx.input_root is not None:
         ent = input_entity_for_path(ctx.input_root, path)
         if ent in ctx.entity_packs and _path_is_within(ent, path):
-            return resolve_pack_tv_member(path, output_root, tmdb, ctx, ent)
+            entry = resolve_pack_tv_member(path, output_root, tmdb, ctx, ent)
+            entry.entity_key = ent.resolve()
+            return entry
         if ent in ctx.entity_movies and _path_is_within(ent, path):
-            return resolve_movie_entity_member(path, output_root, ctx, ent)
+            entry = resolve_movie_entity_member(path, output_root, ctx, ent)
+            entry.entity_key = ent.resolve()
+            return entry
     g = guess_kind(path)
     if is_series_pack_folder(path, ctx.all_files) and g == "movie":
         g = "ambiguous"
 
     if g == "ambiguous":
-        return resolve_ambiguous_dual(path, output_root, tmdb, ctx)
-    if g == "episode":
-        return resolve_episode(path, output_root, tmdb, ctx)
-    return resolve_movie(path, output_root, tmdb, ctx)
+        entry = resolve_ambiguous_dual(path, output_root, tmdb, ctx)
+    elif g == "episode":
+        entry = resolve_episode(path, output_root, tmdb, ctx)
+    else:
+        entry = resolve_movie(path, output_root, tmdb, ctx)
+    entry.entity_key = path.resolve()
+    return entry
 
 
 def build_plan(
@@ -1249,4 +1284,97 @@ def build_plan(
     entries: list[PlanEntry] = []
     for p in sorted(files, key=lambda x: str(x).lower()):
         entries.append(resolve_path(p, output_root, tmdb, ctx, ignore_tmdb=ignore_tmdb))
-    return RenamePlan(entries=entries)
+    labels = _build_entity_labels(entries, ctx)
+    return RenamePlan(entries=entries, labels=labels)
+
+
+_CONFIDENCE_RANK: dict[ConfidenceLevel, int] = {"low": 0, "medium": 1, "high": 2}
+
+
+def _build_entity_labels(
+    entries: list[PlanEntry], ctx: PlanContext
+) -> list[EntityLabel]:
+    """Group PlanEntries into one label per entity (folder or loose file).
+
+    Sort order: low-confidence rows first (most likely to need editing in the
+    search-review UI), then medium, then high. Within a tier, alphabetical by
+    display name.
+    """
+    by_key: dict[Path, list[PlanEntry]] = {}
+    for e in entries:
+        key = e.entity_key if e.entity_key is not None else e.src.resolve()
+        by_key.setdefault(key, []).append(e)
+
+    labels: list[EntityLabel] = []
+    for key, group in by_key.items():
+        if key in ctx.entity_packs:
+            pb = ctx.entity_packs[key]
+            labels.append(
+                EntityLabel(
+                    key=key,
+                    display_name=key.name,
+                    kind="tv",
+                    tmdb_id=pb.tmdb_tv_id,
+                    title=pb.series_name,
+                    year=pb.year,
+                    confidence=pb.confidence,
+                    reason=pb.reason,
+                    file_count=len(group),
+                    candidates=list(pb.candidates),
+                )
+            )
+            continue
+        if key in ctx.entity_movies:
+            mb = ctx.entity_movies[key]
+            labels.append(
+                EntityLabel(
+                    key=key,
+                    display_name=key.name,
+                    kind="movie",
+                    tmdb_id=mb.tmdb_movie_id,
+                    title=mb.title,
+                    year=mb.year,
+                    confidence=mb.confidence,
+                    reason=mb.reason,
+                    file_count=len(group),
+                    candidates=list(mb.candidates),
+                )
+            )
+            continue
+        # Per-file label (key == file path).
+        pf = ctx.per_file_label.get(key)
+        if pf is not None:
+            labels.append(
+                EntityLabel(
+                    key=key,
+                    display_name=key.name,
+                    kind=pf.kind,
+                    tmdb_id=pf.tmdb_id,
+                    title=pf.title,
+                    year=pf.year,
+                    confidence=pf.confidence,
+                    reason=pf.reason,
+                    file_count=len(group),
+                    candidates=list(pf.candidates),
+                )
+            )
+            continue
+        # Skipped via {tmdb-id} tag, or some other path with no recorded label.
+        e0 = group[0]
+        labels.append(
+            EntityLabel(
+                key=key,
+                display_name=key.name,
+                kind="skipped",
+                tmdb_id=e0.tmdb_movie_id or e0.tmdb_tv_id,
+                title=key.name,
+                year=None,
+                confidence="high",
+                reason=e0.note or "no resolution",
+                file_count=len(group),
+                candidates=[],
+            )
+        )
+
+    labels.sort(key=lambda lb: (_CONFIDENCE_RANK[lb.confidence], lb.display_name.lower()))
+    return labels

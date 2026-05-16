@@ -207,7 +207,9 @@ class TestPreparePackResolve(unittest.TestCase):
             ctx = PlanContext(all_files=[f1])
             prepare_pack_tv_resolve(ctx, tmdb, input_root)
 
-            self.assertEqual(ctx.entity_packs[show.resolve()], (42, "Show Name"))
+            packed = ctx.entity_packs[show.resolve()]
+            self.assertEqual(packed.tmdb_tv_id, 42)
+            self.assertEqual(packed.series_name, "Show Name")
             self.assertIn(show.resolve(), ctx.series_by_root)
 
     def test_resolve_path_extra_under_pack(self) -> None:

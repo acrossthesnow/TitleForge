@@ -11,7 +11,7 @@ from typing import Any, Literal, TypeVar
 import questionary
 from questionary import Style
 
-from titleforge.classify import guess_kind, looks_episode, looks_movie, parse_sxe, series_query_string
+from titleforge.classify import _S00E00, guess_kind, looks_episode, looks_movie, parse_sxe, series_query_string
 from titleforge.extra_category import infer_plex_extra_folder
 from titleforge.models import ConfidenceLevel, EntityLabel, PlanEntry, RenamePlan
 from titleforge.nfo import collect_ids_near_video
@@ -512,6 +512,14 @@ def _user_notice(path: Path | None, message: str) -> None:
     print(f"TitleForge{tag}: {message}", file=sys.stderr, flush=True)
 
 
+_ANSI_RESET = "\033[0m"
+_ANSI_DIM = "\033[2m"
+_ANSI_KIND: dict[str, str] = {
+    "MOVIE": "\033[1;92m",  # bright bold green
+    "TV": "\033[1;96m",     # bright bold cyan
+}
+
+
 def _entity_decision_notice(
     kind: str,
     title: str,
@@ -519,18 +527,22 @@ def _entity_decision_notice(
     tmdb_id: int,
     entity: Path,
 ) -> None:
-    """Single consolidated decision line per entity binding: `[KIND] Title (Year) {tmdb-id}`.
+    """Single consolidated decision line per entity binding: ``[KIND] Title (Year) {tmdb-id}``.
 
-    Intentionally terse — replaces the previous two-line "Auto-selected best …" +
-    "Bound: …" pair so confident picks scroll cleanly. The entity folder name is
-    still surfaced via the `[name]` tag for traceability.
+    The entity ``entity`` is intentionally **not** printed — for confident binds
+    the chosen TMDB title already names what was matched, and the source folder
+    is surfaced separately in the Phase 1.5 search-review table. ANSI color is
+    applied to ``[MOVIE]``/``[TV]`` so the kind scans at a glance; the colors
+    are stripped when stderr isn't a TTY so piped/logged output stays clean.
     """
     y = f" ({year})" if year else ""
-    print(
-        f"TitleForge [{entity.name}]: [{kind}] {title}{y} {{tmdb-{tmdb_id}}}",
-        file=sys.stderr,
-        flush=True,
-    )
+    if sys.stderr.isatty():
+        tag = f"{_ANSI_KIND.get(kind, '')}[{kind}]{_ANSI_RESET}"
+        idtag = f"{_ANSI_DIM}{{tmdb-{tmdb_id}}}{_ANSI_RESET}"
+    else:
+        tag = f"[{kind}]"
+        idtag = f"{{tmdb-{tmdb_id}}}"
+    print(f"{tag} {title}{y} {idtag}", file=sys.stderr, flush=True)
 
 
 TPick = TypeVar("TPick")
@@ -771,6 +783,24 @@ def resolve_ambiguous_dual(
     return entry
 
 
+def _derive_episode_title_from_stem(stem: str) -> str | None:
+    """Pull a likely episode title out of a scene-style filename.
+
+    For ``Firefly (2002) - S01E12 - The Message (1080p BluRay x265 Silence)``
+    this returns ``"The Message"``. Returns ``None`` if the stem doesn't have
+    an ``SxxEyy`` marker or the segment after it is empty after stripping
+    release noise.
+    """
+    m = _S00E00.search(stem)
+    if m is None:
+        return None
+    after = stem[m.end():]
+    after = strip_release_info(after, aggressive=True)
+    after = after.strip(" \t-_.")
+    after = re.sub(r"\s+", " ", after).strip()
+    return after or None
+
+
 def _finalize_episode(
     path: Path,
     output_root: Path,
@@ -781,17 +811,24 @@ def _finalize_episode(
 ) -> PlanEntry:
     sxe = parse_sxe(path)
     if sxe is None:
-        q = questionary.text(
-            "Could not parse SxxEyy. Enter season,episode as S,E (e.g. 3,12):",
-            default="",
-        ).unsafe_ask()
-        if not q or "," not in q:
-            return PlanEntry(src=path, dest=None, kind="skipped", note="No S/E")
-        a, b = q.split(",", 1)
-        try:
-            sxe = (int(a.strip()), int(b.strip()))
-        except ValueError:
-            return PlanEntry(src=path, dest=None, kind="skipped", note="Bad S/E")
+        # Phase 1 is silent — flag for review instead of prompting. The user
+        # sees this row in the Phase 1.5 search-review with reason "missing
+        # SxxEyy" and can edit / skip from there.
+        ctx.per_file_label[path] = _PerFileLabel(
+            kind="tv",
+            tmdb_id=tv_id,
+            title=series_name,
+            year=None,
+            confidence="low",
+            reason="missing SxxEyy",
+        )
+        return PlanEntry(
+            src=path,
+            dest=None,
+            kind="skipped",
+            tmdb_tv_id=tv_id,
+            note="missing SxxEyy",
+        )
 
     season, episode = sxe
 
@@ -815,13 +852,32 @@ def _finalize_episode(
         if int(ep.get("episode_number", -1)) == episode:
             ep_title = ep.get("name")
             break
-    if ep_title is None:
-        ep_title = questionary.text(
-            f"Episode title not on TMDB (S{season:02d}E{episode:02d}). Enter title or leave blank:",
-            default="",
-        ).unsafe_ask()
-        if not ep_title:
+    derived_from_filename = False
+    if not ep_title:
+        # No TMDB title for this episode — try to lift one out of the filename
+        # (most scene/Plex-formatted releases include `... - SxxEyy - <title>`)
+        # before falling back to "Episode". No prompt either way.
+        derived = _derive_episode_title_from_stem(path.stem)
+        if derived:
+            ep_title = derived
+            derived_from_filename = True
+        else:
             ep_title = "Episode"
+            derived_from_filename = True
+
+    if derived_from_filename:
+        # Make it discoverable in the Phase 1.5 review so the user can sanity-
+        # check the auto-derived title without us interrupting Phase 1.
+        existing = ctx.per_file_label.get(path)
+        if existing is None or existing.confidence == "high":
+            ctx.per_file_label[path] = _PerFileLabel(
+                kind="tv",
+                tmdb_id=tv_id,
+                title=series_name,
+                year=None,
+                confidence="medium",
+                reason=f"episode title S{season:02d}E{episode:02d} derived from filename",
+            )
 
     dest = build_episode_dest(
         output_root,

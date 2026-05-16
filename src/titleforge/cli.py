@@ -9,6 +9,7 @@ import typer
 from titleforge.cleanup import remove_empty_source_dirs
 from titleforge.config import ensure_tmdb_credentials_interactive, get_tmdb_api_key, load_dotenv_sources
 from titleforge.discover import discover_videos
+from titleforge.rescue import rescue_orphan_sidecars
 from titleforge.resolve import build_plan
 from titleforge.review_app import run_review
 from titleforge.search_review_app import run_search_review
@@ -74,6 +75,15 @@ def main(
             "--cleanup nor --no-cleanup is given, you'll be prompted at the end."
         ),
     ),
+    rescue_sidecars: bool = typer.Option(
+        False,
+        "--rescue-sidecars",
+        help=(
+            "Recovery mode: scan --input for orphan subtitle/sidecar files "
+            "left behind by a prior run and move them next to their videos "
+            "already in --output. Skips Phase 1/1.5/2 and cleanup."
+        ),
+    ),
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
@@ -86,6 +96,28 @@ def main(
     key = get_tmdb_api_key()
     tmdb = TmdbClient(key, lang)
     try:
+        if rescue_sidecars:
+            typer.echo(f"Rescue mode: scanning {input_dir} for orphan subtitle files…")
+            try:
+                result = rescue_orphan_sidecars(input_dir, output_dir, tmdb)
+            except TmdbAuthError as e:
+                typer.secho(str(e), fg=typer.colors.RED, err=True)
+                raise typer.Exit(1) from None
+            if result.moved:
+                typer.secho(
+                    f"Rescue: moved {len(result.moved)} sidecar file(s).",
+                    fg=typer.colors.GREEN,
+                )
+            else:
+                typer.secho("Rescue: no sidecars moved.", fg=typer.colors.YELLOW)
+            if result.unmatched:
+                typer.secho(
+                    f"Rescue: {len(result.unmatched)} source folder(s) skipped "
+                    "(couldn't confidently identify the movie). See per-folder "
+                    "notices above.",
+                    fg=typer.colors.YELLOW,
+                )
+            return
         files = discover_videos(input_dir)
         if not files:
             typer.secho("No video files found under input.", fg=typer.colors.YELLOW)

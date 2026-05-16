@@ -24,6 +24,65 @@ SIDECAR_EXTENSIONS = frozenset(
     {".srt", ".sub", ".idx", ".ass", ".ssa", ".vtt", ".sup"}
 )
 
+# ISO-639 codes Plex commonly recognizes as the language tag in a Plex sidecar
+# filename (Title.<lang>[.<mod>].ext). Used only to split an orphan sidecar's
+# name into stem + suffix when we don't have the original video to compare
+# against — see :func:`split_sidecar_basename`.
+_KNOWN_LANG_CODES = frozenset(
+    {
+        "en", "eng", "es", "spa", "fr", "fra", "fre", "de", "deu", "ger",
+        "ja", "jpn", "it", "ita", "pt", "por", "nl", "dut", "nld",
+        "zh", "chi", "zho", "cmn", "ko", "kor", "ar", "ara", "ru", "rus",
+        "pl", "pol", "tr", "tur", "sv", "swe", "no", "nor", "da", "dan",
+        "fi", "fin", "el", "ell", "gre", "he", "heb", "hi", "hin",
+        "id", "ind", "th", "tha", "vi", "vie", "uk", "ukr", "cs", "ces", "cze",
+        "ro", "ron", "rum", "hu", "hun", "bg", "bul", "et", "est",
+        "lv", "lav", "lt", "lit", "sk", "slk", "slo", "sl", "slv", "sr", "srp",
+        "hr", "hrv", "ms", "msa", "may", "fa", "per", "fas", "ur", "urd",
+        "tl", "tgl", "ca", "cat", "bn", "ben", "ta", "tam", "te", "tel",
+    }
+)
+
+# Plex sidecar accessibility / variant tags that may follow the language code.
+_KNOWN_MODIFIERS = frozenset({"forced", "sdh", "cc", "hi", "default"})
+
+
+def split_sidecar_basename(name: str) -> tuple[str, str]:
+    """Split a sidecar filename into ``(video_stem, suffix_after_stem)``.
+
+    Walks dot-separated tokens from the right and consumes the extension plus
+    any contiguous known language codes / modifiers into the suffix. Returns
+    ``(stem, "." + ".".join(suffix_tokens))`` such that
+    ``stem + suffix == name``. Used by the rescue tool when the original
+    video has already been moved and we can't read its stem off disk.
+
+    Examples::
+
+        split_sidecar_basename("Foo.Bar.2001.srt")
+            → ("Foo.Bar.2001", ".srt")
+        split_sidecar_basename("Foo.Bar.2001.en.srt")
+            → ("Foo.Bar.2001", ".en.srt")
+        split_sidecar_basename("Foo.Bar.2001.en.forced.srt")
+            → ("Foo.Bar.2001", ".en.forced.srt")
+        split_sidecar_basename("Foo.Bar.2001.1080p.YIFY.srt")
+            → ("Foo.Bar.2001.1080p.YIFY", ".srt")  # no lang/mod tokens
+    """
+    parts = name.split(".")
+    if len(parts) < 2:
+        return name, ""
+    suffix_parts = [parts[-1]]
+    i = len(parts) - 2
+    while i > 0:
+        tok = parts[i].lower()
+        if tok in _KNOWN_MODIFIERS or tok in _KNOWN_LANG_CODES:
+            suffix_parts.insert(0, parts[i])
+            i -= 1
+        else:
+            break
+    stem = ".".join(parts[: i + 1])
+    suffix = "." + ".".join(suffix_parts)
+    return stem, suffix
+
 
 def find_sidecars(video: Path) -> list[Path]:
     """Return sidecar files in ``video``'s directory whose name starts with the

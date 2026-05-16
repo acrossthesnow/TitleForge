@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from titleforge.sidecars import find_sidecars, sidecar_dest
+from titleforge.sidecars import find_sidecars, sidecar_dest, split_sidecar_basename
 
 
 def _touch(p: Path) -> None:
@@ -87,6 +87,39 @@ class TestSidecarDest(unittest.TestCase):
             sidecar_dest(sc, video, video_dest).name,
             "Final Fantasy (2001).en.forced.srt",
         )
+
+
+class TestSplitSidecarBasename(unittest.TestCase):
+    def test_plain_srt(self) -> None:
+        stem, suffix = split_sidecar_basename("Foo.Bar.2001.srt")
+        self.assertEqual(stem, "Foo.Bar.2001")
+        self.assertEqual(suffix, ".srt")
+
+    def test_lang_tag(self) -> None:
+        stem, suffix = split_sidecar_basename("Foo.Bar.2001.en.srt")
+        self.assertEqual(stem, "Foo.Bar.2001")
+        self.assertEqual(suffix, ".en.srt")
+
+    def test_lang_plus_modifier(self) -> None:
+        stem, suffix = split_sidecar_basename("Foo.Bar.2001.en.forced.srt")
+        self.assertEqual(stem, "Foo.Bar.2001")
+        self.assertEqual(suffix, ".en.forced.srt")
+
+    def test_release_tail_not_consumed(self) -> None:
+        # `YIFY` etc. are not lang codes — they belong to the stem so the
+        # sidecar still matches the original video filename it sat next to.
+        stem, suffix = split_sidecar_basename("Foo.Bar.2001.1080p.BrRip.YIFY.srt")
+        self.assertEqual(stem, "Foo.Bar.2001.1080p.BrRip.YIFY")
+        self.assertEqual(suffix, ".srt")
+
+    def test_three_letter_lang(self) -> None:
+        stem, suffix = split_sidecar_basename("Foo.Bar.2001.eng.srt")
+        self.assertEqual(stem, "Foo.Bar.2001")
+        self.assertEqual(suffix, ".eng.srt")
+
+    def test_idx_sub_pair(self) -> None:
+        stem, _ = split_sidecar_basename("Movie.Name.idx")
+        self.assertEqual(stem, "Movie.Name")
 
 
 if __name__ == "__main__":

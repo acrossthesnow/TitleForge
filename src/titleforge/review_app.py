@@ -12,6 +12,7 @@ from textual.widgets import Button, DataTable, Footer, Input, Label
 from rich.text import Text
 
 from titleforge.models import PlanEntry, RenamePlan
+from titleforge.sidecars import find_sidecars, sidecar_dest
 
 
 class PathEditModal(ModalScreen[str | None]):
@@ -137,6 +138,7 @@ class ReviewApp(App[None]):
                 self.notify(f"Refusing overwrite existing file:\n{dest}", severity="error", timeout=10)
                 return
 
+        sidecar_count = 0
         for e in self.plan.entries:
             if e.kind == "skipped" or e.dest is None:
                 continue
@@ -144,8 +146,31 @@ class ReviewApp(App[None]):
             if dest.exists() and e.src.resolve() == dest:
                 continue
             dest.parent.mkdir(parents=True, exist_ok=True)
+            # Snapshot sidecars BEFORE moving the video — the moved video's
+            # parent won't have them anymore, and we want to preserve language
+            # / `.forced` tag suffixes that hang off the source stem.
+            sidecars = find_sidecars(e.src)
             shutil.move(str(e.src), str(dest))
+            for sc in sidecars:
+                sc_dest = sidecar_dest(sc, e.src, dest)
+                if sc_dest.exists():
+                    # Don't overwrite an existing subtitle at the destination.
+                    continue
+                try:
+                    shutil.move(str(sc), str(sc_dest))
+                    sidecar_count += 1
+                except OSError:
+                    # Best-effort: a failed sidecar move shouldn't tank the run.
+                    self.notify(
+                        f"Could not move sidecar:\n{sc}", severity="warning", timeout=6
+                    )
 
+        if sidecar_count:
+            self.notify(
+                f"Moved {sidecar_count} sidecar file(s) alongside their videos.",
+                severity="information",
+                timeout=4,
+            )
         self._done = "proceed"
         self.exit()
 

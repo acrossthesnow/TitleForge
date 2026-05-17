@@ -75,5 +75,38 @@ class TestAnyParenYearFallback(unittest.TestCase):
         self.assertEqual(c.year, 2002)
 
 
+class TestSceneAndSourceCleanup(unittest.TestCase):
+    """Regression coverage for the failing-inbox cases: scene group, streaming
+    source tag, and pack-range cleanup must not leave junk in the TMDB query."""
+
+    def test_sons_of_anarchy_pack_folder(self) -> None:
+        c = clean_stem_for_search(
+            "Sons.of.Anarchy.S01.1080p.AMZN.WEBRip.DDP5.1.x265-SiGMA[rartv]"
+        )
+        # S01 survives here — the pack-TV resolver strips season markers downstream.
+        # AMZN / WEBRip / DDP5.1 / x265 / -SiGMA / [rartv] must all be gone.
+        self.assertEqual(c.title, "Sons of Anarchy S01")
+        self.assertIsNone(c.year)
+
+    def test_samurai_jack_pack_folder(self) -> None:
+        c = clean_stem_for_search(
+            "Samurai.Jack.S01.1080p.BluRay.x264-pcroland[rartv]"
+        )
+        self.assertEqual(c.title, "Samurai Jack S01")
+        self.assertIsNone(c.year)
+
+    def test_star_trek_enterprise_pack_range(self) -> None:
+        c = clean_stem_for_search("Star Trek Enterprise Season 1 to 4 Mp4 1080p")
+        self.assertEqual(c.title, "Star Trek Enterprise")
+        self.assertIsNone(c.year)
+
+    def test_dot_year_movie_with_streaming_source_in_tail(self) -> None:
+        # _RELEASE_TAIL now lists streaming abbreviations so the dot-year
+        # heuristic still recognises tails like `.AMZN.WEB-DL.x265-Group`.
+        c = clean_stem_for_search("Movie.2020.AMZN.WEB-DL.x265-Group")
+        self.assertEqual(c.year, 2020)
+        self.assertEqual(c.title, "Movie")
+
+
 if __name__ == "__main__":
     unittest.main()

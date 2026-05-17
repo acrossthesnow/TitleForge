@@ -2,9 +2,10 @@
 
 One row per entity (top-level folder under ``--input``, or a loose file).
 Confidence-sorted: low rows pin to the top in red, medium in yellow, high in
-green at the bottom. Edit (`e`) drops out of Textual via :meth:`App.suspend`
-into the existing :func:`prompt_search_with_type` so the user can re-pick the
-TMDB match using the shipped Tab toggle.
+green at the bottom. Edit (`e`) opens a Textual modal with the same Tab-toggle
+search-type cycle that ``prompt_search_with_type`` uses outside the TUI — but
+implemented as a ``ModalScreen`` so it stays inside Textual's event loop (mixing
+prompt_toolkit's ``asyncio.run()`` with Textual's running loop crashes).
 
 Mirrors ``review_app.py``'s style and idioms: plain ``DataTable``, ``Footer``
 for binding hints, ``Text`` cells so brace tags in titles render literally.
@@ -18,7 +19,9 @@ from typing import Any
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import DataTable, Footer, Label
+from textual.containers import Horizontal
+from textual.screen import ModalScreen
+from textual.widgets import Button, DataTable, Footer, Input, Label
 
 from titleforge.models import (
     ConfidenceLevel,
@@ -27,6 +30,7 @@ from titleforge.models import (
     RenamePlan,
 )
 from titleforge.plex_paths import build_episode_dest, build_movie_dest
+from titleforge.prompt_ui import SEARCH_TYPE_CYCLE, SearchType, _SEARCH_TYPE_LABEL
 from titleforge.tmdb_client import TmdbClient
 from titleforge.tmdb_errors import TmdbAuthError
 
@@ -52,6 +56,64 @@ def _match_cell(label: EntityLabel) -> Text:
 
 def _kind_cell(label: EntityLabel) -> Text:
     return Text(label.kind.upper())
+
+
+class SearchEditModal(ModalScreen["tuple[SearchType, str] | None"]):
+    """Edit a row's TMDB search: text input + Tab-cycled search type.
+
+    Returns ``(search_type, query)`` via :meth:`ModalScreen.dismiss` or ``None``
+    on cancel / empty submit. Stays entirely inside Textual's event loop —
+    replaces an older ``with self.suspend(): prompt_search_with_type(...)``
+    block that crashed with ``asyncio.run() cannot be called from a running
+    event loop`` (prompt_toolkit's session.prompt() spawns its own asyncio
+    loop, which collides with the loop Textual is already running).
+    """
+
+    BINDINGS = [
+        Binding("tab", "cycle_type", show=False),
+        Binding("escape", "cancel", show=False),
+    ]
+
+    def __init__(self, message: str, default: str, initial_type: SearchType) -> None:
+        super().__init__()
+        self._message = message
+        self._default = default
+        self._state = SEARCH_TYPE_CYCLE.index(initial_type)
+
+    def compose(self) -> ComposeResult:
+        yield Label(self._message)
+        yield Label(self._type_label(), id="search_type_label")
+        yield Input(value=self._default, id="search_input")
+        with Horizontal(classes="button_row"):
+            yield Button("Search", variant="primary", id="search_btn")
+            yield Button("Cancel", id="cancel_btn")
+
+    def _type_label(self) -> str:
+        label = _SEARCH_TYPE_LABEL[SEARCH_TYPE_CYCLE[self._state]]
+        return f"[{label}]  (Tab: switch type)"
+
+    def action_cycle_type(self) -> None:
+        self._state = (self._state + 1) % len(SEARCH_TYPE_CYCLE)
+        self.query_one("#search_type_label", Label).update(self._type_label())
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._submit(event.value)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "search_btn":
+            self._submit(self.query_one("#search_input", Input).value)
+        else:
+            self.dismiss(None)
+
+    def _submit(self, raw: str) -> None:
+        q = raw.strip()
+        if not q:
+            self.dismiss(None)
+            return
+        self.dismiss((SEARCH_TYPE_CYCLE[self._state], q))
 
 
 class SearchReviewApp(App[str]):
@@ -196,31 +258,38 @@ class SearchReviewApp(App[str]):
         self._refresh_table()
 
     def action_edit(self) -> None:
-        """Open the Tab-toggle search prompt for the selected row.
+        """Open the Tab-toggle search modal for the selected row.
 
-        Suspends the Textual app so prompt_toolkit can own the terminal cleanly
-        (Textual + prompt_toolkit don't co-exist on the same screen). On return,
-        re-runs the search via :func:`_manual_dispatch` and replaces the label.
+        Pushes a :class:`SearchEditModal` and dispatches the result through
+        :meth:`_after_edit`. Staying inside the Textual loop avoids the
+        asyncio-running-loop crash from mixing prompt_toolkit's session.prompt()
+        with Textual.
         """
         lb = self._selected_label()
         if lb is None:
             return
-        # Imported lazily to avoid a circular import at module load (resolve.py
-        # imports models which imports... only stdlib, so this is just defensive).
-        from titleforge.prompt_ui import prompt_search_with_type
-        from titleforge.resolve import _manual_dispatch, PlanContext
-
-        initial_type = "movie" if lb.kind == "movie" else ("tv" if lb.kind == "tv" else "both")
+        initial_type: SearchType = (
+            "movie" if lb.kind == "movie" else ("tv" if lb.kind == "tv" else "both")
+        )
         default_query = lb.title or lb.display_name
-
-        with self.suspend():
-            res = prompt_search_with_type(
+        self.push_screen(
+            SearchEditModal(
                 f"Edit search for [{lb.display_name}]:",
-                default=default_query,
-                initial_type=initial_type,
-            )
+                default_query,
+                initial_type,
+            ),
+            lambda res: self._after_edit(lb, res),
+        )
+
+    def _after_edit(
+        self, lb: EntityLabel, res: "tuple[SearchType, str] | None"
+    ) -> None:
+        """Apply the user's edited search result to the label + its plan entries."""
         if res is None:
             return
+        # Imported lazily to avoid a circular import at module load.
+        from titleforge.resolve import _manual_dispatch, PlanContext
+
         search_type, query = res
         # Build a one-off context just for this edit; we don't want the temporary
         # search to leak into series_by_root for unrelated paths.
@@ -242,8 +311,6 @@ class SearchReviewApp(App[str]):
         except TmdbAuthError as e:
             self.notify(f"TMDB auth error: {e}", severity="error", timeout=10)
             return
-        # Re-derive the label from the new_entry + ctx, then apply to every file
-        # under this entity.
         new_lb_kind = (
             "movie"
             if new_entry.kind == "movie"
@@ -253,8 +320,6 @@ class SearchReviewApp(App[str]):
         if new_tmdb_id is None:
             self.notify("No TMDB match found.", severity="warning", timeout=6)
             return
-        # Pull title/year from per_file_label if available; otherwise reuse the
-        # query string.
         pf = tmp_ctx.per_file_label.get(sample_src)
         if pf is not None:
             lb.title = pf.title
@@ -269,7 +334,6 @@ class SearchReviewApp(App[str]):
         lb.kind = new_lb_kind
         lb.tmdb_id = new_tmdb_id
         self._candidate_idx.pop(lb.key, None)
-        # Apply to every PlanEntry under this entity.
         self._rebuild_entries_for_label(lb)
         self._refresh_table()
 

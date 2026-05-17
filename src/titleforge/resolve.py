@@ -122,6 +122,104 @@ def _is_under_extras_container(path: Path, entity_root: Path) -> bool:
     return False
 
 
+def _format_episode_run(episodes: set[int]) -> str:
+    """Compact contiguous-run formatter.
+
+    ``{1,2,3,4,5,6,7,8,9,10,11,12,13}`` → ``"E1-E13"``;
+    ``{1,2,3,4,5,7,8,9,10,11,12,13}``  → ``"E1-E5, E7-E13"``;
+    ``{5}`` → ``"E5"``; ``set()`` → ``""``.
+    """
+    if not episodes:
+        return ""
+    nums = sorted(episodes)
+    runs: list[str] = []
+    start = prev = nums[0]
+    for n in nums[1:]:
+        if n != prev + 1:
+            runs.append(f"E{start}" if start == prev else f"E{start}-E{prev}")
+            start = n
+        prev = n
+    runs.append(f"E{start}" if start == prev else f"E{start}-E{prev}")
+    return ", ".join(runs)
+
+
+def _summarise_pack_seasons(
+    member_files: list[Path],
+) -> tuple[dict[int, set[int]], str]:
+    """Group pack members by season → set of episode numbers and produce the
+    short summary string that goes on the decision line.
+
+    Single season → ``S03 (E1-E13)`` (gaps spelled out as ``E1-E5, E8-E13``).
+    Multi-season → ``S01-S04 (52 eps)``. Extras-only pack → ``""``.
+    """
+    by_season: dict[int, set[int]] = {}
+    for f in member_files:
+        sxe = parse_sxe(f)
+        if sxe is None:
+            continue
+        season, episode = sxe
+        by_season.setdefault(season, set()).add(episode)
+    if not by_season:
+        return {}, ""
+    seasons = sorted(by_season)
+    if len(seasons) == 1:
+        s = seasons[0]
+        return by_season, f"S{s:02d} ({_format_episode_run(by_season[s])})"
+    total = sum(len(eps) for eps in by_season.values())
+    return by_season, f"S{seasons[0]:02d}-S{seasons[-1]:02d} ({total} eps)"
+
+
+def _compute_missing(
+    by_season: dict[int, set[int]],
+    ctx: "PlanContext",
+    tmdb: TmdbClient,
+    tv_id: int,
+) -> str:
+    """Return missing-episodes string (e.g. ``"E13"`` or ``"S01E07, S03E02-S03E05"``)
+    or ``""`` when the pack covers every expected episode.
+
+    Skips season 0 (specials) — TMDB specials inventories are notoriously
+    incomplete and would generate false positives. Also skips when the pack
+    has a single episode in a single season; that's usually intentional
+    (user grabbed one episode on purpose).
+    """
+    if not by_season:
+        return ""
+    only_one_season = len(by_season) == 1
+    if only_one_season:
+        sole = next(iter(by_season.values()))
+        if len(sole) == 1:
+            return ""
+    parts: list[str] = []
+    for season in sorted(by_season):
+        if season == 0:
+            continue
+        try:
+            payload = ctx.get_season_json(tmdb, tv_id, season)
+        except Exception:
+            continue
+        expected = {
+            ep.get("episode_number")
+            for ep in (payload.get("episodes") or [])
+            if isinstance(ep.get("episode_number"), int)
+        }
+        missing = expected - by_season[season]
+        if not missing:
+            continue
+        # The function already returned "" for single-episode single-season
+        # packs above; here we always emit if there are missing.
+        if only_one_season:
+            parts.append(_format_episode_run(missing))  # type: ignore[arg-type]
+        else:
+            for run in _format_episode_run(missing).split(", "):  # type: ignore[arg-type]
+                if "-" in run:
+                    lhs, rhs = run.split("-", 1)
+                    parts.append(f"S{season:02d}{lhs}-S{season:02d}{rhs}")
+                else:
+                    parts.append(f"S{season:02d}{run}")
+    return ", ".join(parts)
+
+
 def prepare_pack_tv_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root: Path) -> None:
     """
     One TV series pick per **first-level folder** under ``--input`` when that subtree
@@ -185,7 +283,17 @@ def prepare_pack_tv_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root: Path
             candidates=candidates,
         )
         ctx.series_by_root[er] = (tv_id, series_name)
-        _entity_decision_notice("TV", series_name, tv_year, tv_id, entity)
+        by_season, summary = _summarise_pack_seasons(subset)
+        missing = _compute_missing(by_season, ctx, tmdb, tv_id) if by_season else ""
+        _entity_decision_notice(
+            "TV",
+            series_name,
+            tv_year,
+            tv_id,
+            entity,
+            summary=summary or None,
+            missing=missing or None,
+        )
 
 
 _COLLECTION_HINT = re.compile(r"(?i)\b(collection|trilogy|anthology|saga|box\s*set|complete)\b")
@@ -514,6 +622,7 @@ def _user_notice(path: Path | None, message: str) -> None:
 
 _ANSI_RESET = "\033[0m"
 _ANSI_DIM = "\033[2m"
+_ANSI_RED = "\033[31m"
 _ANSI_KIND: dict[str, str] = {
     "MOVIE": "\033[1;92m",  # bright bold green
     "TV": "\033[1;96m",     # bright bold cyan
@@ -526,6 +635,9 @@ def _entity_decision_notice(
     year: int | str | None,
     tmdb_id: int,
     entity: Path,
+    *,
+    summary: str | None = None,
+    missing: str | None = None,
 ) -> None:
     """Single consolidated decision line per entity binding: ``[KIND] Title (Year) {tmdb-id}``.
 
@@ -534,15 +646,31 @@ def _entity_decision_notice(
     is surfaced separately in the Phase 1.5 search-review table. ANSI color is
     applied to ``[MOVIE]``/``[TV]`` so the kind scans at a glance; the colors
     are stripped when stderr isn't a TTY so piped/logged output stays clean.
+
+    ``summary`` (e.g. ``S01 (E1-E13)``) renders in dim grey between the title
+    and the TMDB id tag — useful when several packs of the same series bind
+    one after another and would otherwise look identical. ``missing`` (e.g.
+    ``E11, E12, E13``) prints on a second indented line in red, prefixed with
+    ``⚠ missing:`` so incomplete rips are obvious at a glance.
     """
     y = f" ({year})" if year else ""
-    if sys.stderr.isatty():
+    is_tty = sys.stderr.isatty()
+    if is_tty:
         tag = f"{_ANSI_KIND.get(kind, '')}[{kind}]{_ANSI_RESET}"
         idtag = f"{_ANSI_DIM}{{tmdb-{tmdb_id}}}{_ANSI_RESET}"
+        s_text = f" {_ANSI_DIM}{summary}{_ANSI_RESET}" if summary else ""
     else:
         tag = f"[{kind}]"
         idtag = f"{{tmdb-{tmdb_id}}}"
-    print(f"{tag} {title}{y} {idtag}", file=sys.stderr, flush=True)
+        s_text = f" {summary}" if summary else ""
+    print(f"{tag} {title}{y}{s_text} {idtag}", file=sys.stderr, flush=True)
+    if missing:
+        warn = (
+            f"    {_ANSI_RED}⚠ missing: {missing}{_ANSI_RESET}"
+            if is_tty
+            else f"    ! missing: {missing}"
+        )
+        print(warn, file=sys.stderr, flush=True)
 
 
 TPick = TypeVar("TPick")

@@ -87,5 +87,81 @@ class TestEntityDecisionNotice(unittest.TestCase):
         self.assertNotEqual(movie, tv)
 
 
+class TestSeasonSummaryAndMissing(unittest.TestCase):
+    def test_summary_appears_between_year_and_id(self) -> None:
+        out = _capture(
+            isatty=False,
+            kind="TV",
+            title="Samurai Jack",
+            year=2001,
+            tmdb_id=2723,
+            entity=Path("/inbox/Samurai.Jack.S01"),
+            summary="S01 (E1-E13)",
+        )
+        self.assertEqual(
+            out.strip(),
+            "[TV] Samurai Jack (2001) S01 (E1-E13) {tmdb-2723}",
+        )
+
+    def test_summary_dim_wrapped_on_tty(self) -> None:
+        out = _capture(
+            isatty=True,
+            kind="TV",
+            title="Samurai Jack",
+            year=2001,
+            tmdb_id=2723,
+            entity=Path("/inbox/Samurai.Jack.S01"),
+            summary="S01 (E1-E13)",
+        )
+        # Summary text must appear and be dim-wrapped.
+        self.assertIn("S01 (E1-E13)", out)
+        self.assertIn("\033[2m", out)
+
+    def test_missing_emits_second_line_with_red_on_tty(self) -> None:
+        out = _capture(
+            isatty=True,
+            kind="TV",
+            title="Samurai Jack",
+            year=2001,
+            tmdb_id=2723,
+            entity=Path("/inbox/Samurai.Jack.S05"),
+            summary="S05 (E1-E10)",
+            missing="E11, E12, E13",
+        )
+        lines = out.splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("⚠ missing: E11, E12, E13", lines[1])
+        self.assertIn("\033[31m", lines[1])
+
+    def test_missing_ascii_fallback_when_piped(self) -> None:
+        out = _capture(
+            isatty=False,
+            kind="TV",
+            title="Samurai Jack",
+            year=2001,
+            tmdb_id=2723,
+            entity=Path("/inbox/Samurai.Jack.S05"),
+            summary="S05 (E1-E10)",
+            missing="E11, E12, E13",
+        )
+        lines = out.splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("! missing: E11, E12, E13", lines[1])
+        # No ANSI sequences anywhere.
+        self.assertNotIn("\033[", out)
+
+    def test_no_summary_means_no_change_to_existing_format(self) -> None:
+        out = _capture(
+            isatty=False,
+            kind="TV",
+            title="Show",
+            year=2001,
+            tmdb_id=1,
+            entity=Path("/x"),
+        )
+        # Single line, no extra spacing between title and id tag.
+        self.assertEqual(out.strip(), "[TV] Show (2001) {tmdb-1}")
+
+
 if __name__ == "__main__":
     unittest.main()

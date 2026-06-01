@@ -88,6 +88,13 @@ class SearchEditModal(ModalScreen["tuple[SearchType, str] | None"]):
             yield Button("Search", variant="primary", id="search_btn")
             yield Button("Cancel", id="cancel_btn")
 
+    def on_mount(self) -> None:
+        # Without this the underlying DataTable keeps focus, the user types
+        # blindly into the table (which silently filters / scrolls), and Enter
+        # is consumed by the App-level "approve" binding instead of the Input's
+        # submit handler — which looks exactly like "Enter does nothing."
+        self.query_one("#search_input", Input).focus()
+
     def _type_label(self) -> str:
         label = _SEARCH_TYPE_LABEL[SEARCH_TYPE_CYCLE[self._state]]
         return f"[{label}]  (Tab: switch type)"
@@ -376,20 +383,26 @@ class SearchReviewApp(App[str]):
     def _rebuild_entries_for_label(self, label: EntityLabel) -> None:
         """Recompute dest paths for every PlanEntry under this label.
 
-        Keeps the file's existing kind/season/episode metadata where possible —
-        only swaps the TMDB id and title in. Falls back to dest=None when the
-        new kind doesn't match the old (e.g. movie ↔ episode swap; the user
-        will land in the next-candidate cycle or re-edit).
+        Re-resolves each file against the label's new (kind, tmdb_id, title).
+        Importantly, an entry that was previously ``kind="skipped"`` (because
+        Phase 1 couldn't match it) gets re-finalized here — without this the
+        user's manual edit updates the label cell but the underlying file move
+        stays disabled, which looks like "edit did nothing."
         """
+        from titleforge.classify import parse_sxe
+        from titleforge.resolve import PlanContext, _finalize_episode
+
         if label.tmdb_id is None:
             for entry in self._entries_for(label):
                 entry.dest = None
             return
-        for entry in self._entries_for(label):
-            if label.kind == "movie":
+        if label.kind == "movie":
+            for entry in self._entries_for(label):
                 entry.kind = "movie"
                 entry.tmdb_movie_id = label.tmdb_id
                 entry.tmdb_tv_id = None
+                entry.season = None
+                entry.episode = None
                 entry.dest = build_movie_dest(
                     self.output_root,
                     label.title,
@@ -397,29 +410,42 @@ class SearchReviewApp(App[str]):
                     entry.src,
                     tmdb_movie_id=label.tmdb_id,
                 )
-            elif label.kind == "tv":
+            return
+        if label.kind == "tv":
+            entries = self._entries_for(label)
+            # Share a single per-edit cache so multi-file packs (S01E01..E13)
+            # fetch each season payload from TMDB exactly once.
+            ctx = PlanContext(all_files=[e.src for e in entries])
+            for entry in entries:
                 entry.tmdb_tv_id = label.tmdb_id
                 entry.tmdb_movie_id = None
-                if entry.kind == "episode" and entry.season is not None and entry.episode is not None:
-                    # Keep the old episode/extra dest shape; just swap the show id.
-                    entry.dest = build_episode_dest(
-                        self.output_root,
-                        label.title,
-                        entry.season,
-                        entry.episode,
-                        entry.src.stem,
+                if parse_sxe(entry.src) is None and entry.season is None:
+                    # No SxxEyy → can't form an episode dest; leave skipped.
+                    entry.kind = "skipped"
+                    entry.dest = None
+                    continue
+                try:
+                    rebuilt = _finalize_episode(
                         entry.src,
-                        tmdb_tv_id=label.tmdb_id,
+                        self.output_root,
+                        self.tmdb,
+                        ctx,
+                        label.tmdb_id,
+                        label.title,
                     )
-                else:
-                    # Extras and unparsed files: leave the existing dest path
-                    # alone if it was computed, else null it out. The user can
-                    # edit further or skip from here.
-                    if entry.dest is None:
-                        continue
-            else:
-                entry.kind = "skipped"
-                entry.dest = None
+                except Exception:
+                    entry.kind = "skipped"
+                    entry.dest = None
+                    continue
+                entry.kind = rebuilt.kind
+                entry.season = rebuilt.season
+                entry.episode = rebuilt.episode
+                entry.dest = rebuilt.dest
+            return
+        # label.kind == "skipped" (manual skip)
+        for entry in self._entries_for(label):
+            entry.kind = "skipped"
+            entry.dest = None
 
     @property
     def outcome(self) -> str:

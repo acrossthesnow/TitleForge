@@ -109,6 +109,33 @@ class TestAudioFragments(unittest.TestCase):
         self.assertNotIn("2", s)
 
 
+class TestLanguageAudioTokens(unittest.TestCase):
+    """HIDI / ENG / JPN / MULTi tokens between the resolution and the source
+    used to leak into TMDB queries (`Pantheon S01 HIDI` returned zero hits).
+    The cleaner has to drop them like any other release-noise token."""
+
+    def test_hidi_between_resolution_and_source_dropped(self) -> None:
+        s = strip_release_info("Pantheon.S01E01.1080p.HIDI.WEB-DL.AAC2.0.H.264-NTb")
+        self.assertEqual(s, "Pantheon S01E01")
+
+    def test_eng_jpn_kor_dropped(self) -> None:
+        for tag in ("ENG", "JPN", "KOR", "ITA", "FRA", "GER", "RUS", "SPA"):
+            s = strip_release_info(f"Title.S01E01.1080p.{tag}.WEB-DL.x265-Grp")
+            self.assertNotIn(tag.lower(), s.lower(), f"{tag} should be stripped, got {s!r}")
+
+    def test_multi_dual_audio_dropped(self) -> None:
+        for tag in ("MULTI", "MULTi", "DUAL", "DUAL.AUDIO", "DUBBED"):
+            s = strip_release_info(f"Title.S01E01.1080p.{tag}.WEB-DL.x265-Grp")
+            self.assertNotIn(tag.lower(), s.lower(), f"{tag} should be stripped, got {s!r}")
+
+    def test_short_two_letter_titles_preserved(self) -> None:
+        # ENG/JPN are 3+ char so dropping them doesn't risk titles like "IT"
+        # (2017), "MA" (2019). Sanity-check the boundary explicitly.
+        self.assertEqual(strip_release_info("IT"), "IT")
+        self.assertEqual(strip_release_info("MA"), "MA")
+        self.assertEqual(strip_release_info("EN"), "EN")
+
+
 class TestPerFileStem(unittest.TestCase):
     def test_samurai_jack_per_file_stem(self) -> None:
         s = strip_release_info(

@@ -1234,6 +1234,14 @@ def resolve_movie(
         title = detail.get("title") or detail.get("original_title") or "Unknown"
         y = _year_from_movie(detail)
         dest = build_movie_dest(output_root, title, y, path, tmdb_movie_id=tmdb_movie_id)
+        ctx.per_file_label[path] = _PerFileLabel(
+            kind="movie",
+            tmdb_id=tmdb_movie_id,
+            title=title,
+            year=y,
+            confidence="high",
+            reason="from NFO TMDB id",
+        )
         return PlanEntry(
             src=path,
             dest=dest,
@@ -1249,6 +1257,14 @@ def resolve_movie(
             title = detail.get("title") or detail.get("original_title") or "Unknown"
             y = _year_from_movie(detail)
             dest = build_movie_dest(output_root, title, y, path, tmdb_movie_id=mid)
+            ctx.per_file_label[path] = _PerFileLabel(
+                kind="movie",
+                tmdb_id=mid,
+                title=title,
+                year=y,
+                confidence="high",
+                reason=f"from IMDb {_imdb_tt(imdb_id)}",
+            )
             return PlanEntry(
                 src=path,
                 dest=dest,
@@ -1339,6 +1355,15 @@ def resolve_episode(
         query = series_query_string(path)
         if root is not None:
             qn = strip_release_info(root.name, aggressive=True)
+            # Drop season hints baked into the folder name (`Pantheon S01`,
+            # `Show Season 1`, `Show Complete Series`) so the TMDB query is
+            # just the show title. Mirrors prepare_pack_tv_resolve so loose
+            # episodes get the same cleanup pack-bound ones already get.
+            qn = re.sub(
+                r"(?i)\b(S\d{1,4}|Season\s*\d{1,4}|Complete(?:\s*Series)?)\b",
+                " ",
+                qn,
+            )
             qn = re.sub(r"\s+", " ", qn).strip()
             if qn:
                 query = qn

@@ -42,6 +42,14 @@ _RESOLUTION = re.compile(
     # boundary keeps the false-positive rate negligible.
     r"amzn|aptv|atvp|hmax|hulu|itunes|pcok|pmtp|stan|starz|strz|crave|dsnp|"
     r"nf|"
+    # Audio language indicators. Scene encoders insert these between the
+    # resolution and source (Pantheon.S01E01.1080p.HIDI.WEB-DL.…) — without
+    # them in the strip list the language tag leaks into the TMDB query.
+    # Restricted to multi-char codes (ENG/JPN/HINDI/MULTI/…) so two-letter
+    # title fragments (IT, MA, EN, ES, …) stay intact.
+    r"hindi|hidi|eng|esp|esub|fre|fra|ger|deu|"
+    r"ita|jpn|kor|chi|cht|chs|rus|por|spa|swe|nor|dan|fin|nld|tur|"
+    r"multi(?:[._-]?\d+)?|dual(?:[._-]?audio)?|dub(?:bed)?|subbed|"
     # Generic release markers
     r"repack|proper|multi|extended|unrated|imax|open[._-]?matte|"
     # Container tokens (callers pass stem/folder, never the actual extension)

@@ -90,6 +90,12 @@ class TestPackMemberLabelConsistency(unittest.TestCase):
             self.assertNotIn("S01E02", lb2.title)
             self.assertEqual(lb2.confidence, "high")
             self.assertEqual(lb2.reason, "series binding")
+            # File #2 must also carry the show year so it renders as
+            # "Supernatural (2005)" — the user-reported inconsistency was
+            # file #1 having "(2005)" and file #2 missing it.
+            self.assertEqual(lb2.year, 2005, "file #2 must inherit the year via series_year_by_tv_id")
+            lb1 = by_key[f1.resolve()]
+            self.assertEqual(lb1.year, 2005)
 
 
 if __name__ == "__main__":

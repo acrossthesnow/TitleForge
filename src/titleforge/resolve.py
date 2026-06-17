@@ -91,6 +91,11 @@ class PlanContext:
     # build_plan(). Avoids growing PlanEntry's surface area when the data is
     # really only needed for the search-review UI.
     per_file_label: dict[Path, "_PerFileLabel"] = field(default_factory=dict)
+    # tv_id -> first-air year, captured wherever we already fetch tv_detail. Read
+    # by _finalize_episode so files #2..#N of a pack (which short-circuit the
+    # search via series_by_root) can render `Series (YYYY)` on their label
+    # without an extra TMDB round-trip.
+    series_year_by_tv_id: dict[int, int | None] = field(default_factory=dict)
 
     def get_season_json(self, tmdb: TmdbClient, tv_id: int, season: int) -> dict[str, Any]:
         key = (tv_id, season)
@@ -283,6 +288,7 @@ def prepare_pack_tv_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root: Path
             candidates=candidates,
         )
         ctx.series_by_root[er] = (tv_id, series_name)
+        ctx.series_year_by_tv_id[tv_id] = tv_year
         by_season, summary = _summarise_pack_seasons(subset)
         missing = _compute_missing(by_season, ctx, tmdb, tv_id) if by_season else ""
         _entity_decision_notice(
@@ -888,6 +894,7 @@ def resolve_ambiguous_dual(
     tv_id = int(row["id"])
     detail = tmdb.tv_detail(tv_id)
     series_name = detail.get("name") or detail.get("original_name") or "Series"
+    ctx.series_year_by_tv_id[tv_id] = _year_from_tv_search_row(detail)
     root = series_group_root(path, ctx.all_files)
     if root is not None:
         ctx.series_by_root[root] = (tv_id, series_name)
@@ -946,7 +953,7 @@ def _finalize_episode(
             kind="tv",
             tmdb_id=tv_id,
             title=series_name,
-            year=None,
+            year=ctx.series_year_by_tv_id.get(tv_id),
             confidence="low",
             reason="missing SxxEyy",
         )
@@ -1002,7 +1009,7 @@ def _finalize_episode(
                 kind="tv",
                 tmdb_id=tv_id,
                 title=series_name,
-                year=None,
+                year=ctx.series_year_by_tv_id.get(tv_id),
                 confidence="medium",
                 reason=f"episode title S{season:02d}E{episode:02d} derived from filename",
             )
@@ -1027,7 +1034,7 @@ def _finalize_episode(
             kind="tv",
             tmdb_id=tv_id,
             title=series_name,
-            year=None,
+            year=ctx.series_year_by_tv_id.get(tv_id),
             confidence="high",
             reason="series binding",
         )
@@ -1133,6 +1140,7 @@ def _manual_tv(
     tv_id = int(pick["id"])
     detail = tmdb.tv_detail(tv_id)
     series_name = detail.get("name") or detail.get("original_name") or "Series"
+    ctx.series_year_by_tv_id[tv_id] = _year_from_tv_search_row(detail)
     root = series_group_root(path, ctx.all_files)
     if root is not None:
         ctx.series_by_root[root] = (tv_id, series_name)
@@ -1203,6 +1211,7 @@ def _manual_dual(
     tv_id = int(row["id"])
     detail = tmdb.tv_detail(tv_id)
     series_name = detail.get("name") or detail.get("original_name") or "Series"
+    ctx.series_year_by_tv_id[tv_id] = _year_from_tv_search_row(detail)
     root = series_group_root(path, ctx.all_files)
     if root is not None:
         ctx.series_by_root[root] = (tv_id, series_name)
@@ -1417,6 +1426,7 @@ def resolve_episode(
         tv_id = int(pick["id"])
         detail = tmdb.tv_detail(tv_id)
         series_name = detail.get("name") or detail.get("original_name") or "Series"
+        ctx.series_year_by_tv_id[tv_id] = _year_from_tv_search_row(detail)
         resolved_tv = (tv_id, series_name)
         if root is not None:
             ctx.series_by_root[root] = resolved_tv

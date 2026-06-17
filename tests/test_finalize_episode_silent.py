@@ -58,6 +58,9 @@ class TestFinalizeEpisodeSilent(unittest.TestCase):
             }
 
             ctx = PlanContext(all_files=[f], input_root=input_root)
+            # Pre-seed the cached first-air year (resolve_episode / pack-bind
+            # paths populate this whenever they fetch tv_detail).
+            ctx.series_year_by_tv_id[42] = 2005
             entry = _finalize_episode(f, Path(td) / "out", tmdb, ctx, tv_id=42, series_name="Show")
             self.assertEqual(entry.kind, "episode")
             self.assertIsNotNone(entry.dest)
@@ -65,11 +68,13 @@ class TestFinalizeEpisodeSilent(unittest.TestCase):
             # High-confidence "series binding" label so _build_entity_labels
             # surfaces the series name (not the raw filename) for files #2..#N
             # of a pack where file #1 cached series_by_root and subsequent
-            # files skip the search inside resolve_episode.
+            # files skip the search inside resolve_episode. The year must come
+            # from the cache so file #2's label renders as "Show (2005)" too.
             label = ctx.per_file_label[f]
             self.assertEqual(label.kind, "tv")
             self.assertEqual(label.tmdb_id, 42)
             self.assertEqual(label.title, "Show")
+            self.assertEqual(label.year, 2005)
             self.assertEqual(label.confidence, "high")
             self.assertEqual(label.reason, "series binding")
 

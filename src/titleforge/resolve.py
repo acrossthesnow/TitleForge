@@ -1016,6 +1016,21 @@ def _finalize_episode(
         path,
         tmdb_tv_id=tv_id,
     )
+    # Record a label so _build_entity_labels doesn't catch-all on file #2..#N
+    # of a pack (file #1 does the TMDB search and writes the label; subsequent
+    # files reuse series_by_root and would otherwise have no per_file_label,
+    # falling to the catch-all that stamps the raw filename as title).
+    # Only write if no higher-priority label is already present (medium = derived
+    # title, low = missing SxxEyy — both set above).
+    if path not in ctx.per_file_label:
+        ctx.per_file_label[path] = _PerFileLabel(
+            kind="tv",
+            tmdb_id=tv_id,
+            title=series_name,
+            year=None,
+            confidence="high",
+            reason="series binding",
+        )
     return PlanEntry(
         src=path,
         dest=dest,

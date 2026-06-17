@@ -62,8 +62,16 @@ class TestFinalizeEpisodeSilent(unittest.TestCase):
             self.assertEqual(entry.kind, "episode")
             self.assertIsNotNone(entry.dest)
             self.assertIn("Pilot (TMDB)", entry.dest.name)
-            # No medium-confidence label, since title came from TMDB.
-            self.assertNotIn(f, ctx.per_file_label)
+            # High-confidence "series binding" label so _build_entity_labels
+            # surfaces the series name (not the raw filename) for files #2..#N
+            # of a pack where file #1 cached series_by_root and subsequent
+            # files skip the search inside resolve_episode.
+            label = ctx.per_file_label[f]
+            self.assertEqual(label.kind, "tv")
+            self.assertEqual(label.tmdb_id, 42)
+            self.assertEqual(label.title, "Show")
+            self.assertEqual(label.confidence, "high")
+            self.assertEqual(label.reason, "series binding")
 
     def test_no_tmdb_title_derives_from_filename(self) -> None:
         with tempfile.TemporaryDirectory() as td:

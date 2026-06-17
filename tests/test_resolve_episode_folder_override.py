@@ -60,6 +60,45 @@ class TestResolveEpisodeFolderOverride(unittest.TestCase):
             # normalize._RESOLUTION; this test pins them together.
             self.assertNotIn("HIDI", queries[0])
 
+    def test_blu_ray_hyphenated_folder_strips_source_tag(self) -> None:
+        """Regression: a Supernatural folder named with `Blu-Ray` (hyphenated)
+        searched TMDB as ``"Supernatural Blu-Ray"`` and returned zero hits
+        because the strip list only knew ``BluRay`` (no separator)."""
+        with tempfile.TemporaryDirectory() as td:
+            input_root = Path(td)
+            pack = (
+                input_root
+                / "SUPERNATURAL SEASON 1-12 COMPLETE [2005-2017] Blu-Ray H265 HEVC-Adyen"
+            )
+            f = pack / "Supernatural.S01E01.1080p.Blu-Ray.H265-Adyen.mkv"
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(b"")
+
+            tmdb = MagicMock()
+            tmdb.search_tv.return_value = [
+                {"id": 1622, "name": "Supernatural", "first_air_date": "2005-09-13"}
+            ]
+            tmdb.tv_detail.return_value = {
+                "name": "Supernatural",
+                "first_air_date": "2005-09-13",
+            }
+            tmdb.tv_season.return_value = {
+                "episodes": [{"episode_number": 1, "name": "Pilot"}]
+            }
+
+            ctx = PlanContext(all_files=[f], input_root=input_root)
+            resolve_episode(f, Path(td) / "out", tmdb, ctx)
+
+            queries = [call.args[0] for call in tmdb.search_tv.call_args_list]
+            self.assertTrue(queries, "expected at least one search_tv call")
+            for q in queries:
+                self.assertNotIn("Blu-Ray", q, f"Blu-Ray leaked into query: {q!r}")
+                self.assertNotIn("Blu", q, f"Blu leaked into query: {q!r}")
+                self.assertNotIn("Ray", q, f"Ray leaked into query: {q!r}")
+                self.assertNotIn("H265", q, f"H265 leaked into query: {q!r}")
+                self.assertNotIn("HEVC", q.upper(), f"HEVC leaked: {q!r}")
+            self.assertIn("Supernatural", queries[0].title())
+
     def test_complete_series_folder_collapsed(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             input_root = Path(td)

@@ -26,7 +26,7 @@ _RESOLUTION = re.compile(
     # HDR / dynamic range
     r"hdr10\+?|hdr\d*|dovi|dv|"
     # Source / format
-    r"web-?dl|web-?rip|webrip|bluray|bdrip|brrip|bdremux|dvdrip|dvd5|dvd9|"
+    r"web-?dl|web-?rip|webrip|blu[._-]?ray|bd-?rip|br-?rip|bd-?remux|dvd-?rip|dvd5|dvd9|"
     r"hdtv|hdrip|remux|"
     # Codec
     r"x\.?\s*264|x\.?\s*265|h\.?\s*264|h\.?\s*265|hevc|avc|av1|vp9|"

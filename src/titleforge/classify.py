@@ -23,7 +23,7 @@ _NAME_DOT_YEAR = re.compile(
     r"^(?P<t>.+?)[.\s_-]+(?P<y>(?:19|20)\d{2})[.\s_-]+(?P<rest>.+)$"
 )
 _RELEASE_TAIL = re.compile(
-    r"(?i)\b(720p|1080p|2160p|4k|web-?dl|webrip|bluray|bdrip|brrip|dvdrip|hdtv|"
+    r"(?i)\b(720p|1080p|2160p|4k|web-?dl|webrip|blu[._-]?ray|bd-?rip|br-?rip|dvd-?rip|hdtv|"
     r"remux|extended|unrated|repack|proper|multi|x264|x265|hevc|h\.?264|h\.?265|"
     r"av1|hdr\d*|sdr|uhd|dv|truehd|atmos|dts|aac\d*|ac3|eac3|ddp?\d|imax|"
     r"amzn|nf|hmax|dsnp|hulu|atvp|pcok|stan|crave|starz)\b"

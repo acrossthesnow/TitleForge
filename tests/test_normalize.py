@@ -136,6 +136,50 @@ class TestLanguageAudioTokens(unittest.TestCase):
         self.assertEqual(strip_release_info("EN"), "EN")
 
 
+class TestSourceTagHyphenVariants(unittest.TestCase):
+    """Scene encoders mix forms: BluRay, Blu-Ray, Blu.Ray, BDRip, BD-Rip.
+    Pre-fix, only the no-separator forms were in the strip list, so a folder
+    like ``SUPERNATURAL SEASON 1-12 COMPLETE [2005-2017] Blu-Ray H265 HEVC-Adyen``
+    cleaned down to ``Supernatural Blu-Ray``, which TMDB returns nothing for."""
+
+    def test_supernatural_blu_ray_folder_collapses_to_title(self) -> None:
+        # Standalone `COMPLETE` (no series/show/pack/collection trailing) is
+        # left for resolve.py's override pass; what strip_release_info MUST
+        # drop here is the hyphenated `Blu-Ray` — pre-fix that leaked into
+        # TMDB as "Supernatural Blu-Ray" and returned zero hits.
+        s = strip_release_info(
+            "SUPERNATURAL SEASON 1-12 COMPLETE [2005-2017] Blu-Ray H265 HEVC-Adyen"
+        )
+        self.assertNotIn("blu", s.lower(), f"Blu-Ray leaked: {s!r}")
+        self.assertNotIn("ray", s.lower(), f"Blu-Ray leaked: {s!r}")
+        self.assertNotIn("H265", s)
+        self.assertNotIn("HEVC", s.upper())
+        self.assertIn("SUPERNATURAL", s)
+
+    def test_blu_ray_hyphen_form_stripped(self) -> None:
+        s = strip_release_info("Show.S01E01.1080p.Blu-Ray.x264-Grp")
+        self.assertNotIn("blu", s.lower())
+        self.assertNotIn("ray", s.lower())
+
+    def test_blu_dot_ray_form_stripped(self) -> None:
+        s = strip_release_info("Show.S01E01.1080p.Blu.Ray.x264-Grp")
+        self.assertNotIn("blu", s.lower())
+        self.assertNotIn("ray", s.lower())
+
+    def test_bluray_no_separator_still_works(self) -> None:
+        s = strip_release_info("Show.S01E01.1080p.BluRay.x264-Grp")
+        self.assertNotIn("bluray", s.lower())
+
+    def test_bd_rip_and_br_rip_hyphen_form_stripped(self) -> None:
+        for tag in ("BD-Rip", "BR-Rip", "BD-Remux", "DVD-Rip"):
+            s = strip_release_info(f"Show.S01E01.1080p.{tag}.x264-Grp")
+            self.assertNotIn(
+                tag.replace("-", "").lower(),
+                s.lower().replace("-", ""),
+                f"{tag} should be stripped, got {s!r}",
+            )
+
+
 class TestPerFileStem(unittest.TestCase):
     def test_samurai_jack_per_file_stem(self) -> None:
         s = strip_release_info(

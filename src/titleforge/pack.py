@@ -7,7 +7,12 @@ import re
 from pathlib import Path
 
 from titleforge.classify import _S00E00, guess_kind, parse_sxe
-from titleforge.series_folder import _SEASON_DIR, is_extras_parent_name
+from titleforge.series_folder import (
+    _ALT_SEASON_DIR,
+    _SEASON_DIR,
+    is_extras_parent_name,
+    parse_alt_season_dir,
+)
 
 
 def _path_under_or_equal(ancestor: Path, path: Path) -> bool:
@@ -122,7 +127,7 @@ def is_single_tv_pack(files: list[Path], root: Path) -> bool:
     root = root.resolve()
     if root.parent == root:
         return False
-    if _SEASON_DIR.match(root.name):
+    if _SEASON_DIR.match(root.name) or _ALT_SEASON_DIR.match(root.name):
         return False
     segs = first_segments_under(root, files)
     segs.discard("")
@@ -131,14 +136,26 @@ def is_single_tv_pack(files: list[Path], root: Path) -> bool:
     if len(segs) == 1:
         return _root_has_tv_signals(root, files)
     # Allow loose SxxEyy filenames at the root alongside Season/Extras dirs (Firefly layout).
+    accepted_via_alt_only = False
     for s in segs:
         if _SEASON_DIR.match(s):
+            continue
+        if _ALT_SEASON_DIR.match(s):
+            accepted_via_alt_only = True
             continue
         if is_extras_parent_name(s):
             continue
         if _S00E00.search(s):
             continue
         return False
+    # Alt-season naming ("Book One - Water", "Part 1") overlaps with movie layouts
+    # like "Movie/Part 1/Part 2"; require corroborating SxxEyy in at least one file
+    # before we treat such a layout as a TV pack.
+    if accepted_via_alt_only and not any(
+        _SEASON_DIR.match(s) or _S00E00.search(s) for s in segs
+    ):
+        if not any(parse_sxe(f) is not None for f in files):
+            return False
     return True
 
 
@@ -147,11 +164,11 @@ _season_num = re.compile(r"(?i)^(?:season\s*(\d{1,4})|(s)(\d{1,4}))$")
 
 def season_number_from_dir_name(name: str) -> int | None:
     m = _season_num.match(name.strip())
-    if not m:
-        return None
-    if m.group(1):
-        return int(m.group(1))
-    return int(m.group(3))
+    if m:
+        if m.group(1):
+            return int(m.group(1))
+        return int(m.group(3))
+    return parse_alt_season_dir(name)
 
 
 def infer_season_from_path_ancestors(path: Path, stop_at: Path) -> int | None:

@@ -14,11 +14,16 @@ from titleforge.pack import (
     infer_season_from_path_ancestors,
     input_entity_for_path,
     is_single_tv_pack,
+    season_number_from_dir_name,
 )
 from titleforge.extra_category import infer_plex_extra_folder
 from titleforge.plex_paths import build_season_extra_dest
 from titleforge.resolve import PlanContext, prepare_pack_tv_resolve, resolve_path
-from titleforge.series_folder import series_group_root
+from titleforge.series_folder import (
+    is_season_dir_name,
+    parse_alt_season_dir,
+    series_group_root,
+)
 
 
 class TestSeriesGroupPastFeaturettes(unittest.TestCase):
@@ -111,6 +116,174 @@ class TestPackHeuristics(unittest.TestCase):
             [inp / "A", inp / "B"],
         )
         self.assertEqual(input_entity_for_path(inp, inp / "A" / "S01E01.mkv"), inp / "A")
+
+
+class TestAltSeasonNaming(unittest.TestCase):
+    """Avatar uses "Book One - Water" as season-1 folder. Other shows use
+    "Volume 2", "Part 3", "Chapter 4". Treat these as season folders so the
+    pack binds to one TV identity instead of every episode searching the
+    season-folder name as a TMDB query."""
+
+    def test_parse_alt_season_dir_word_numerals(self) -> None:
+        self.assertEqual(parse_alt_season_dir("Book One - Water"), 1)
+        self.assertEqual(parse_alt_season_dir("Book Two - Earth"), 2)
+        self.assertEqual(parse_alt_season_dir("Book Three - Fire"), 3)
+        self.assertEqual(parse_alt_season_dir("Book Ten"), 10)
+
+    def test_parse_alt_season_dir_digit_numerals(self) -> None:
+        self.assertEqual(parse_alt_season_dir("Volume 2"), 2)
+        self.assertEqual(parse_alt_season_dir("Vol. 3"), 3)
+        self.assertEqual(parse_alt_season_dir("Vol 4"), 4)
+        self.assertEqual(parse_alt_season_dir("Part 5"), 5)
+        self.assertEqual(parse_alt_season_dir("Chapter 12"), 12)
+
+    def test_parse_alt_season_dir_rejects_non_season_names(self) -> None:
+        self.assertIsNone(parse_alt_season_dir("Book Club"))
+        self.assertIsNone(parse_alt_season_dir("Random Folder"))
+        self.assertIsNone(parse_alt_season_dir("Season 1"))  # handled by _SEASON_DIR
+
+    def test_is_season_dir_name_matches_both_naming_styles(self) -> None:
+        self.assertTrue(is_season_dir_name("Season 1"))
+        self.assertTrue(is_season_dir_name("S01"))
+        self.assertTrue(is_season_dir_name("Book One - Water"))
+        self.assertTrue(is_season_dir_name("Volume 3"))
+        self.assertFalse(is_season_dir_name("Featurettes"))
+
+    def test_season_number_from_dir_name_alt_format(self) -> None:
+        self.assertEqual(season_number_from_dir_name("Book One - Water"), 1)
+        self.assertEqual(season_number_from_dir_name("Volume 3"), 3)
+        # Strict "Season N" / "Sn" still works.
+        self.assertEqual(season_number_from_dir_name("Season 4"), 4)
+        self.assertEqual(season_number_from_dir_name("S05"), 5)
+
+    def test_series_group_root_walks_past_book_n_to_show_root(self) -> None:
+        """`series_group_root("Show/Book One - Water/S01E01.mkv")` must
+        return the show root, not the "Book One - Water" parent. Pre-fix it
+        returned the parent because ep_like >= 2 triggered before any
+        season-folder recognition."""
+        show = Path("/media/Avatar - The Last Airbender (2005 - 2008) [1080p]")
+        files = [
+            show / "Book One - Water" / "Avatar - S01E01.mkv",
+            show / "Book One - Water" / "Avatar - S01E02.mkv",
+            show / "Book Three - Fire" / "Avatar - S03E01.mkv",
+        ]
+        root = series_group_root(files[0], files)
+        self.assertEqual(root, show.resolve())
+
+    def test_is_single_tv_pack_accepts_book_n_layout(self) -> None:
+        """The Avatar pack: top-level entity has two Book N children that
+        contain SxxEyy episodes. Must bind as a single TV pack."""
+        root = Path("/t/Avatar - The Last Airbender (2005 - 2008) [1080p]")
+        files = [
+            root / "Book One - Water" / "Avatar - The Last Airbender - S01E01.mkv",
+            root / "Book One - Water" / "Avatar - The Last Airbender - S01E02.mkv",
+            root / "Book Three - Fire" / "Avatar - The Last Airbender - S03E01.mkv",
+        ]
+        self.assertTrue(is_single_tv_pack(files, root))
+
+    def test_is_single_tv_pack_rejects_part_n_movie_layout(self) -> None:
+        """`Movie/Part 1/foo.mkv + Movie/Part 2/bar.mkv` with no SxxEyy is a
+        movie split into parts — must NOT be treated as a TV pack just because
+        "Part N" matches the alt-season regex."""
+        root = Path("/t/Some.Long.Movie.2020")
+        files = [
+            root / "Part 1" / "movie.cd1.mkv",
+            root / "Part 2" / "movie.cd2.mkv",
+        ]
+        self.assertFalse(is_single_tv_pack(files, root))
+
+    def test_infer_season_from_book_n_ancestor(self) -> None:
+        pack = Path("/media/Avatar - The Last Airbender (2005 - 2008) [1080p]")
+        p = pack / "Book Three - Fire" / "Avatar - The Last Airbender - S03E04.mkv"
+        self.assertEqual(infer_season_from_path_ancestors(p, pack), 3)
+
+
+class TestAvatarPackEndToEnd(unittest.TestCase):
+    """End-to-end regression: the Avatar inbox layout must bind as a single
+    TV pack and the TMDB query must be the show name, not "Book One - Water"."""
+
+    def test_avatar_pack_binds_and_query_is_show_name(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            input_root = Path(td)
+            show = input_root / "Avatar - The Last Airbender (2005 - 2008) [1080p]"
+            f1 = show / "Book One - Water" / "Avatar - The Last Airbender - S01E01 - The Boy in the Iceberg.mkv"
+            f2 = show / "Book Three - Fire" / "Avatar - The Last Airbender - S03E01 - The Awakening.mkv"
+            for f in (f1, f2):
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_bytes(b"")
+
+            tmdb = MagicMock()
+            tmdb.search_tv.return_value = [
+                {"id": 246, "name": "Avatar: The Last Airbender", "first_air_date": "2005-02-21"}
+            ]
+            tmdb.tv_detail.return_value = {
+                "name": "Avatar: The Last Airbender",
+                "first_air_date": "2005-02-21",
+            }
+            tmdb.tv_season.return_value = {
+                "episodes": [
+                    {"episode_number": 1, "name": "The Boy in the Iceberg"},
+                ]
+            }
+
+            ctx = PlanContext(all_files=[f1, f2], input_root=input_root)
+            prepare_pack_tv_resolve(ctx, tmdb, input_root)
+
+            # The pack must bind under the show root, not be skipped.
+            self.assertIn(show.resolve(), ctx.entity_packs)
+            packed = ctx.entity_packs[show.resolve()]
+            self.assertEqual(packed.tmdb_tv_id, 246)
+
+            # The TMDB query MUST be the show name — never "Book One - Water"
+            # (pre-fix the per-file fallback searched the season folder name).
+            queries = [call.args[0] for call in tmdb.search_tv.call_args_list]
+            self.assertTrue(queries, "expected at least one search_tv call")
+            for q in queries:
+                self.assertNotIn("Book One", q, f"Book One leaked into query: {q!r}")
+                self.assertNotIn("Book Three", q, f"Book Three leaked into query: {q!r}")
+                self.assertNotIn("Water", q, f"Water leaked into query: {q!r}")
+                self.assertNotIn("Fire", q, f"Fire leaked into query: {q!r}")
+            self.assertIn("Avatar", queries[0])
+
+    def test_avatar_episodes_resolve_under_pack_binding(self) -> None:
+        """Files under the bound pack resolve as episodes with the right
+        season numbers (Book One → S01, Book Three → S03), without any extra
+        TMDB show searches."""
+        with tempfile.TemporaryDirectory() as td:
+            input_root = Path(td)
+            show = input_root / "Avatar - The Last Airbender (2005 - 2008) [1080p]"
+            f1 = show / "Book One - Water" / "Avatar - The Last Airbender - S01E01 - The Boy in the Iceberg.mkv"
+            f3 = show / "Book Three - Fire" / "Avatar - The Last Airbender - S03E01 - The Awakening.mkv"
+            for f in (f1, f3):
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_bytes(b"")
+
+            tmdb = MagicMock()
+            tmdb.search_tv.return_value = [
+                {"id": 246, "name": "Avatar: The Last Airbender", "first_air_date": "2005-02-21"}
+            ]
+            tmdb.tv_detail.return_value = {
+                "name": "Avatar: The Last Airbender",
+                "first_air_date": "2005-02-21",
+            }
+            tmdb.tv_season.return_value = {
+                "episodes": [
+                    {"episode_number": 1, "name": "Pilot Ep"},
+                ]
+            }
+
+            ctx = PlanContext(all_files=[f1, f3], input_root=input_root)
+            prepare_pack_tv_resolve(ctx, tmdb, input_root)
+            out = Path(td) / "out"
+            e1 = resolve_path(f1, out, tmdb, ctx, ignore_tmdb=False)
+            e3 = resolve_path(f3, out, tmdb, ctx, ignore_tmdb=False)
+
+            self.assertEqual(e1.kind, "episode")
+            self.assertEqual(e3.kind, "episode")
+            self.assertEqual(e1.season, 1)
+            self.assertEqual(e3.season, 3)
+            # Single TMDB show search (the pack-TV bind) — no per-file re-search.
+            self.assertEqual(tmdb.search_tv.call_count, 1)
 
 
 class TestInferSeason(unittest.TestCase):

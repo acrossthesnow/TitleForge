@@ -12,6 +12,37 @@ from titleforge.extra_category import all_extras_container_normalized
 _SEASON_DIR = re.compile(r"(?i)^(season\s*\d+|s\d+)$")
 _SERIES_WORDS = re.compile(r"(?i)\b(season|series|complete|volume|vol\.?)\b")
 
+# Alt-season naming used by some shows (Avatar uses "Book One - Water", graphic
+# novel adaptations use "Volume N", anthologies use "Part N"). We accept digits
+# or English numerals up to ten, with an optional " - Subtitle" suffix.
+_NUMERAL_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+_ALT_SEASON_DIR = re.compile(
+    r"(?i)^(?:book|volume|vol\.?|part|chapter)\s+"
+    r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten)"
+    r"(?:\s*[-:.]\s*.+)?$"
+)
+
+
+def parse_alt_season_dir(name: str) -> int | None:
+    """Parse "Book One - Water", "Volume 3", "Part 2", "Chapter 5" → season number."""
+    m = _ALT_SEASON_DIR.match(name.strip())
+    if not m:
+        return None
+    g = m.group(1).lower()
+    if g.isdigit():
+        return int(g)
+    return _NUMERAL_WORDS.get(g)
+
+
+def is_season_dir_name(name: str) -> bool:
+    """True for both "Season 1"/"S01" and alt-season "Book One - Water"/"Volume 3"."""
+    s = name.strip()
+    return _SEASON_DIR.match(s) is not None or _ALT_SEASON_DIR.match(s) is not None
+
+
 _EXTRAS_PARENT_NORMALIZED = all_extras_container_normalized()
 
 
@@ -56,7 +87,7 @@ def series_group_root(path: Path, all_files: list[Path]) -> Path | None:
     sibs = _siblings_same_parent(path, all_files)
     ep_like = sum(1 for f in sibs if parse_sxe(f) is not None)
 
-    if _SEASON_DIR.match(name):
+    if _SEASON_DIR.match(name) or _ALT_SEASON_DIR.match(name):
         gp = parent.parent
         if gp != parent.anchor and gp.name:
             gp = _walk_past_extras_containers(gp)

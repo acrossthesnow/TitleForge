@@ -34,6 +34,36 @@ class TestParenYearWithTrailingBrackets(unittest.TestCase):
         self.assertEqual(c.title, "Serenity")
 
 
+class TestParenYearRange(unittest.TestCase):
+    """`Show (2005 - 2008)` — multi-season packs encode the air-date range in
+    parens. We must extract the START year so TMDB search can disambiguate
+    same-named remakes (e.g. 2005 animated Avatar vs. 2024 live-action)."""
+
+    def test_avatar_paren_year_range_with_quality_bracket(self) -> None:
+        c = clean_stem_for_search("Avatar - The Last Airbender (2005 - 2008) [1080p]")
+        self.assertEqual(c.year, 2005)
+        self.assertEqual(c.title, "Avatar - The Last Airbender")
+
+    def test_paren_year_range_hyphen(self) -> None:
+        c = clean_stem_for_search("Some Show (2002 - 2010)")
+        self.assertEqual(c.year, 2002)
+        self.assertEqual(c.title, "Some Show")
+
+    def test_paren_year_range_en_dash(self) -> None:
+        c = clean_stem_for_search("Some Show (2002–2010)")
+        self.assertEqual(c.year, 2002)
+        self.assertEqual(c.title, "Some Show")
+
+    def test_paren_year_range_em_dash(self) -> None:
+        c = clean_stem_for_search("Some Show (2002—2010)")
+        self.assertEqual(c.year, 2002)
+
+    def test_any_paren_year_range_fallback(self) -> None:
+        # Year range buried mid-stem still resolves to the start year.
+        c = clean_stem_for_search("Avatar TLA (2005 - 2008) Complete Series S01 [1080p]")
+        self.assertEqual(c.year, 2005)
+
+
 class TestDotYearReleaseTail(unittest.TestCase):
     def test_the_martian_dot_year_drops_release_tail(self) -> None:
         c = clean_stem_for_search("The.Martian.2015.EXTENDED.2160p.UHD.BluRay.x265-TERMiNAL")

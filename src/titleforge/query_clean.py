@@ -10,7 +10,12 @@ from dataclasses import dataclass
 from titleforge.normalize import strip_release_info
 
 # Title (1937) at end of stem, optionally followed by [tag] groups like [1080p].
-_PAREN_YEAR = re.compile(r"(?i)^(.+?)\s*\(((?:19|20)\d{2})\)\s*(?:\[[^\]]*\]\s*)*$")
+# Also accepts an air-date *range* — `Title (2005 - 2008) [1080p]` — using the
+# start year. Hyphen, en dash, and em dash are all recognised between the years.
+_PAREN_YEAR = re.compile(
+    r"(?i)^(.+?)\s*\(((?:19|20)\d{2})(?:\s*[-–—]\s*(?:19|20)\d{2})?\)"
+    r"\s*(?:\[[^\]]*\]\s*)*$"
+)
 # 1937 - Title or Title - 1937 (full stem, hyphen-separated year only at edges)
 _YEAR_PREFIX = re.compile(r"^(?P<y>(?:19|20)\d{2})\s*-\s*(?P<t>.+)$")
 _YEAR_SUFFIX = re.compile(r"^(?P<t>.+?)\s*-\s*(?P<y>(?:19|20)\d{2})\s*$")
@@ -27,8 +32,11 @@ _RELEASE_TAIL = re.compile(
     r"amzn|nf|hmax|dsnp|hulu|atvp|pcok|stan|crave|starz)\b"
 )
 # Any (YYYY) anywhere in the stem — fallback when nothing else matched (e.g. messy
-# folder names like `Firefly (2002) Season 1 S01 (1080p BluRay ...)`).
-_ANY_PAREN_YEAR = re.compile(r"\(((?:19|20)\d{2})\)")
+# folder names like `Firefly (2002) Season 1 S01 (1080p BluRay ...)`). Year ranges
+# `(2005 - 2008)` collapse to the start year.
+_ANY_PAREN_YEAR = re.compile(
+    r"\(((?:19|20)\d{2})(?:\s*[-–—]\s*(?:19|20)\d{2})?\)"
+)
 
 
 @dataclass(frozen=True)

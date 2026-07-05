@@ -10,6 +10,12 @@ from titleforge.extra_category import all_extras_container_normalized
 
 # Folder name hints: "Season 1", "S01", "Complete Series", etc.
 _SEASON_DIR = re.compile(r"(?i)^(season\s*\d+|s\d+)$")
+# Prefixed season folder names ("Revolution (2012) S01", "The Bear Season 3").
+# STRICT `_SEASON_DIR` keeps its narrow semantic — "the folder name IS a bare
+# season marker" — so pack roots that happen to end with a season token (e.g.
+# `Firefly (2002) Season 1 S01/` with loose episodes) aren't wrongly rejected
+# as a season subfolder in `is_single_tv_pack`.
+_SEASON_TAIL = re.compile(r"(?i)^(?:.*\s)(season\s*\d+|s\d+)$")
 _SERIES_WORDS = re.compile(r"(?i)\b(season|series|complete|volume|vol\.?)\b")
 
 # Alt-season naming used by some shows (Avatar uses "Book One - Water", graphic
@@ -38,9 +44,14 @@ def parse_alt_season_dir(name: str) -> int | None:
 
 
 def is_season_dir_name(name: str) -> bool:
-    """True for both "Season 1"/"S01" and alt-season "Book One - Water"/"Volume 3"."""
+    """True for "Season 1"/"S01", prefixed forms ("Show (2012) S01"), and
+    alt-season "Book One - Water"/"Volume 3"."""
     s = name.strip()
-    return _SEASON_DIR.match(s) is not None or _ALT_SEASON_DIR.match(s) is not None
+    return (
+        _SEASON_DIR.match(s) is not None
+        or _SEASON_TAIL.match(s) is not None
+        or _ALT_SEASON_DIR.match(s) is not None
+    )
 
 
 _EXTRAS_PARENT_NORMALIZED = all_extras_container_normalized()

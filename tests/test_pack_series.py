@@ -198,6 +198,76 @@ class TestAltSeasonNaming(unittest.TestCase):
         self.assertEqual(infer_season_from_path_ancestors(p, pack), 3)
 
 
+class TestPrefixedSeasonFolders(unittest.TestCase):
+    """Season folders whose name has the show as a prefix
+    (`Revolution (2012) S01`, `The Bear Season 3`) — common scene-pack layout."""
+
+    def test_is_season_dir_name_accepts_prefix(self) -> None:
+        self.assertTrue(is_season_dir_name("Revolution (2012) S01"))
+        self.assertTrue(is_season_dir_name("The Bear Season 3"))
+        self.assertTrue(is_season_dir_name("Firefly (2002) Season 1 S01"))
+        # Strict "Season N" / "S01" still work.
+        self.assertTrue(is_season_dir_name("Season 1"))
+        self.assertTrue(is_season_dir_name("S01"))
+        # Non-season names still rejected.
+        self.assertFalse(is_season_dir_name("Featurettes"))
+        self.assertFalse(is_season_dir_name("Wheatley's Letters"))
+        self.assertFalse(is_season_dir_name("Enemies of the State"))
+
+    def test_season_number_from_prefixed_dir(self) -> None:
+        self.assertEqual(season_number_from_dir_name("Revolution (2012) S01"), 1)
+        self.assertEqual(season_number_from_dir_name("Revolution (2012) S02"), 2)
+        self.assertEqual(season_number_from_dir_name("The Bear Season 3"), 3)
+        # Bare forms still work.
+        self.assertEqual(season_number_from_dir_name("Season 1"), 1)
+        self.assertEqual(season_number_from_dir_name("S07"), 7)
+
+    def test_is_single_tv_pack_accepts_prefixed_season_children(self) -> None:
+        root = Path("/t/Revolution (2012) S01-S02 (1080p BluRay Celdra)")
+        files = [
+            root / "Revolution (2012) S01" / "Revolution (2012) - S01E01 - Pilot.mkv",
+            root / "Revolution (2012) S01" / "Featurettes" / "Gag Reel.mkv",
+            root / "Revolution (2012) S02" / "Revolution (2012) - S02E01 - Born in the USA.mkv",
+        ]
+        self.assertTrue(is_single_tv_pack(files, root))
+
+    def test_is_single_tv_pack_accepts_specials_arc_subfolder(self) -> None:
+        """A subfolder whose files are ALL SxxEyy (Revolution's S00 arc
+        `Wheatley's Letters/` and `Enemies of the State/`) doesn't match any
+        season/extras regex but should still be pack-accepted."""
+        root = Path("/t/Revolution (2012) S01-S02 (1080p BluRay Celdra)")
+        files = [
+            root / "Revolution (2012) S01" / "Revolution (2012) - S01E01 - Pilot.mkv",
+            root / "Revolution (2012) S01" / "Revolution (2012) - S01E02 - Chained Heat.mkv",
+            root
+            / "Revolution (2012) Wheatley's Letters"
+            / "Revolution (2012) - S00E11 - Wheatley's Letters May 7th.mkv",
+            root
+            / "Revolution (2012) Wheatley's Letters"
+            / "Revolution (2012) - S00E12 - Wheatley's Letters August 10th.mkv",
+            root
+            / "Revolution (2012) Enemies of the State"
+            / "Revolution (2012) - S00E17 - Enemies of the State Part 1.mkv",
+        ]
+        self.assertTrue(is_single_tv_pack(files, root))
+
+    def test_is_single_tv_pack_rejects_arbitrary_movie_at_root(self) -> None:
+        """A subfolder with a non-episode file (e.g. a loose movie in a mixed
+        top-level dir) must still fail the pack check — the specials-arc
+        tolerance requires EVERY file inside the subfolder to have SxxEyy."""
+        root = Path("/t/Downloads")
+        files = [
+            root / "Some Show S01" / "S01E01.mkv",
+            root / "Some Movie (2020)" / "Some.Movie.2020.1080p.mkv",
+        ]
+        self.assertFalse(is_single_tv_pack(files, root))
+
+    def test_infer_season_from_prefixed_ancestor(self) -> None:
+        pack = Path("/media/Revolution (2012) S01-S02")
+        p = pack / "Revolution (2012) S01" / "Featurettes" / "Gag Reel.mkv"
+        self.assertEqual(infer_season_from_path_ancestors(p, pack), 1)
+
+
 class TestAvatarPackEndToEnd(unittest.TestCase):
     """End-to-end regression: the Avatar inbox layout must bind as a single
     TV pack and the TMDB query must be the show name, not "Book One - Water"."""
@@ -284,6 +354,93 @@ class TestAvatarPackEndToEnd(unittest.TestCase):
             self.assertEqual(e3.season, 3)
             # Single TMDB show search (the pack-TV bind) — no per-file re-search.
             self.assertEqual(tmdb.search_tv.call_count, 1)
+
+
+class TestRevolutionPackEndToEnd(unittest.TestCase):
+    """End-to-end regression for the Revolution inbox layout: the pack must
+    bind to one TMDB show and specials-arc subfolders (`Wheatley's Letters/`)
+    must resolve as S00 specials of that show, not per-file TMDB searches."""
+
+    def test_revolution_pack_binds_and_specials_arc_resolves_as_specials(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            input_root = Path(td)
+            show = input_root / "Revolution (2012) S01-S02 (1080p BluRay x265 10bit EAC3 5.1 Celdra)"
+            s01 = (
+                show
+                / "Revolution (2012) S01"
+                / "Revolution (2012) - S01E01 - Pilot (1080p BluRay x265 Celdra).mkv"
+            )
+            s01_extra = (
+                show
+                / "Revolution (2012) S01"
+                / "Featurettes"
+                / "Season 1 - Gag Reel.mkv"
+            )
+            s02 = (
+                show
+                / "Revolution (2012) S02"
+                / "Revolution (2012) - S02E01 - Born in the U.S.A. (1080p BluRay x265 Celdra).mkv"
+            )
+            wheatley = (
+                show
+                / "Revolution (2012) Wheatley's Letters"
+                / "Revolution (2012) - S00E11 - Wheatley's Letters May 7th (480p WEB x265 Celdra).mkv"
+            )
+            enemies = (
+                show
+                / "Revolution (2012) Enemies of the State"
+                / "Revolution (2012) - S00E17 - Enemies of the State Part 1 (1080p BluRay x265 Celdra).mkv"
+            )
+            all_files = [s01, s01_extra, s02, wheatley, enemies]
+            for f in all_files:
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_bytes(b"")
+
+            tmdb = MagicMock()
+            tmdb.search_tv.return_value = [
+                {"id": 1410, "name": "Revolution", "first_air_date": "2012-09-17"}
+            ]
+            tmdb.tv_detail.return_value = {"name": "Revolution", "first_air_date": "2012-09-17"}
+            tmdb.tv_season.return_value = {"episodes": []}
+
+            ctx = PlanContext(all_files=all_files, input_root=input_root)
+            prepare_pack_tv_resolve(ctx, tmdb, input_root)
+
+            self.assertIn(show.resolve(), ctx.entity_packs, "Revolution pack must bind")
+            self.assertEqual(ctx.entity_packs[show.resolve()].tmdb_tv_id, 1410)
+
+            # Show search query must be the show name — not "Revolution Wheatley's Letters"
+            # nor "Revolution Enemies of the State" (pre-fix per-file resolve leaked the
+            # specials-arc subfolder name into the TMDB query).
+            queries = [call.args[0] for call in tmdb.search_tv.call_args_list]
+            for q in queries:
+                self.assertNotIn("Wheatley", q, f"specials-arc name leaked into query: {q!r}")
+                self.assertNotIn("Enemies", q, f"specials-arc name leaked into query: {q!r}")
+
+            out = Path(td) / "out"
+            e_s01 = resolve_path(s01, out, tmdb, ctx, ignore_tmdb=False)
+            e_s02 = resolve_path(s02, out, tmdb, ctx, ignore_tmdb=False)
+            e_wheatley = resolve_path(wheatley, out, tmdb, ctx, ignore_tmdb=False)
+            e_enemies = resolve_path(enemies, out, tmdb, ctx, ignore_tmdb=False)
+
+            self.assertEqual(e_s01.kind, "episode")
+            self.assertEqual(e_s01.season, 1)
+            self.assertEqual(e_s02.kind, "episode")
+            self.assertEqual(e_s02.season, 2)
+            # Specials arc → season 0 via SxxEyy on the filename, not per-file TMDB search.
+            self.assertEqual(e_wheatley.kind, "episode")
+            self.assertEqual(e_wheatley.season, 0)
+            self.assertEqual(e_wheatley.episode, 11)
+            self.assertEqual(e_enemies.kind, "episode")
+            self.assertEqual(e_enemies.season, 0)
+            self.assertEqual(e_enemies.episode, 17)
+            # Specials render under Specials/, not Season 00/.
+            self.assertIn("Specials", str(e_wheatley.dest))
+            self.assertIn("Specials", str(e_enemies.dest))
+            # Featurettes under a prefixed season folder infer season from ancestor.
+            e_s01_extra = resolve_path(s01_extra, out, tmdb, ctx, ignore_tmdb=False)
+            self.assertEqual(e_s01_extra.kind, "extra")
+            self.assertEqual(e_s01_extra.season, 1)
 
 
 class TestInferSeason(unittest.TestCase):

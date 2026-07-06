@@ -64,12 +64,19 @@ class TestComputeMissing(unittest.TestCase):
         """Specials inventory on TMDB is too noisy to trust."""
         ctx = self._ctx()
         tmdb = MagicMock()
-        tmdb.tv_season.return_value = _season_payload(list(range(1, 20)))
+
+        def fake_season(tv_id: int, season: int) -> dict:
+            if season == 0:
+                raise AssertionError("season 0 (specials) must never be fetched")
+            return _season_payload(list(range(1, 14)))
+
+        tmdb.tv_season.side_effect = fake_season
         # Multi-season so the single-episode exemption doesn't kick in.
         by_season = {0: {1}, 1: set(range(1, 14))}
         out = _compute_missing(by_season, ctx, tmdb, tv_id=1)
         # Season 0 is skipped; season 1 is complete → no missing.
         self.assertEqual(out, "")
+        tmdb.tv_season.assert_called_once_with(1, 1)
 
     def test_season_cache_avoids_double_fetch(self) -> None:
         ctx = self._ctx()

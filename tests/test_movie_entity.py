@@ -129,7 +129,11 @@ class TestPrepareMovieEntityResolve(unittest.TestCase):
                 input_root=input_root,
                 entity_movies={
                     ent.resolve(): MovieEntityBinding(
-                        tmdb_movie_id=999, title="Some Movie", year=2020
+                        tmdb_movie_id=999,
+                        title="Some Movie",
+                        year=2020,
+                        confidence="high",
+                        reason="pre-bound movie folder",
                     ),
                 },
             )

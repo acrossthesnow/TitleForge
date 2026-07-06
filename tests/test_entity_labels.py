@@ -72,7 +72,7 @@ class TestEntityLabels(unittest.TestCase):
             lb = plan.labels[0]
             self.assertEqual(lb.kind, "skipped")
             self.assertEqual(lb.confidence, "low")
-            self.assertIn("no TMDB", lb.reason.lower())
+            self.assertIn("no tmdb", lb.reason.lower())
 
     def test_labels_sorted_low_first(self) -> None:
         """Low rows pin to top; high rows at bottom."""

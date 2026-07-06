@@ -842,6 +842,11 @@ def resolve_ambiguous_dual(
     tmdb: TmdbClient,
     ctx: PlanContext,
 ) -> PlanEntry:
+    # A sibling .nfo with a movie id settles the movie-vs-TV question outright.
+    nfo_entry = _movie_from_nfo_ids(path, output_root, tmdb, ctx)
+    if nfo_entry is not None:
+        return nfo_entry
+
     cleaned = clean_stem_for_search(path.stem)
     q0 = cleaned.title or cleaned.raw_stem or path.stem
     y_note = f" (year filter {cleaned.year})" if cleaned.year else ""
@@ -1246,12 +1251,14 @@ def _manual_dispatch(
     return _manual_dual(query, year, path, output_root, tmdb, ctx)
 
 
-def resolve_movie(
+def _movie_from_nfo_ids(
     path: Path,
     output_root: Path,
     tmdb: TmdbClient,
     ctx: PlanContext,
-) -> PlanEntry:
+) -> PlanEntry | None:
+    """Resolve a movie from a sibling ``.nfo``'s TMDB / IMDb id, skipping the
+    search step entirely. Returns ``None`` when no usable id is found."""
     imdb_id, tmdb_movie_id, _tmdb_tv_id = collect_ids_near_video(path)
     if tmdb_movie_id:
         detail = tmdb.movie_detail(tmdb_movie_id)
@@ -1296,6 +1303,18 @@ def resolve_movie(
                 tmdb_movie_id=mid,
                 note=f"from IMDb {_imdb_tt(imdb_id)}",
             )
+    return None
+
+
+def resolve_movie(
+    path: Path,
+    output_root: Path,
+    tmdb: TmdbClient,
+    ctx: PlanContext,
+) -> PlanEntry:
+    nfo_entry = _movie_from_nfo_ids(path, output_root, tmdb, ctx)
+    if nfo_entry is not None:
+        return nfo_entry
 
     cleaned = clean_stem_for_search(path.stem)
     year_hint = cleaned.year
@@ -1575,8 +1594,17 @@ def _build_entity_labels(
                 )
             )
             continue
-        # Per-file label (key == file path).
+        # Per-file label (key == file path). per_file_label is keyed by the
+        # raw path handed to the resolver, while entity_key is the resolved
+        # path — these differ when the input path crosses a symlink (e.g.
+        # /var/... vs /private/var/... on macOS), so fall back to the group's
+        # source paths.
         pf = ctx.per_file_label.get(key)
+        if pf is None:
+            for e in group:
+                pf = ctx.per_file_label.get(e.src)
+                if pf is not None:
+                    break
         if pf is not None:
             labels.append(
                 EntityLabel(

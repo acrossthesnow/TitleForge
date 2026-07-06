@@ -30,6 +30,9 @@ class _StubApp:
     def __init__(self, *args, **kwargs) -> None:  # pragma: no cover - trivial
         pass
 
+    def __class_getitem__(cls, item):  # support the generic App[str] base
+        return cls
+
 
 _textual_app_stub.App = _StubApp
 _textual_app_stub.ComposeResult = object

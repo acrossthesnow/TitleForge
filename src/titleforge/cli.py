@@ -7,8 +7,15 @@ from pathlib import Path
 import typer
 
 from titleforge.cleanup import remove_empty_source_dirs
-from titleforge.config import ensure_tmdb_credentials_interactive, get_tmdb_api_key, load_dotenv_sources
+from titleforge.config import (
+    ensure_tmdb_credentials_interactive,
+    get_convert_for_streaming_enabled,
+    get_remux_tools,
+    get_tmdb_api_key,
+    load_dotenv_sources,
+)
 from titleforge.discover import discover_videos
+from titleforge.remux import RemuxTools, check_tools
 from titleforge.rescue import rescue_orphan_sidecars
 from titleforge.resolve import build_plan
 from titleforge.review_app import run_review
@@ -75,6 +82,17 @@ def main(
             "--cleanup nor --no-cleanup is given, you'll be prompted at the end."
         ),
     ),
+    convert_for_streaming: bool | None = typer.Option(
+        None,
+        "--convert-for-streaming/--no-convert-for-streaming",
+        help=(
+            "Convert files for streaming compatibility during the Phase 2 moves "
+            "(currently: lossless Dolby Vision profile 7 → 8.1 remux; more "
+            "conversions may be added later). Requires ffmpeg, ffprobe, "
+            "dovi_tool, and mkvmerge. If neither flag is given, the "
+            "CONVERT_FOR_STREAMING config key decides (default: off)."
+        ),
+    ),
     rescue_sidecars: bool = typer.Option(
         False,
         "--rescue-sidecars",
@@ -92,6 +110,19 @@ def main(
     input_dir = input_dir.resolve()
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # CLI flag wins; config key CONVERT_FOR_STREAMING is the fallback. Tool
+    # availability is checked before Phase 1 so a run never fails mid-move on
+    # a missing tool.
+    remux_enabled = (
+        convert_for_streaming
+        if convert_for_streaming is not None
+        else get_convert_for_streaming_enabled()
+    )
+    remux_tools: RemuxTools | None = None
+    if remux_enabled and not rescue_sidecars:
+        remux_tools = get_remux_tools()
+        _ensure_remux_tools_available(remux_tools)
 
     key = get_tmdb_api_key()
     tmdb = TmdbClient(key, lang)
@@ -141,7 +172,7 @@ def main(
                 typer.secho("Cancelled at search review — no files were moved.", fg=typer.colors.YELLOW)
                 raise typer.Exit(1) from None
         typer.echo("Opening file-move review (Phase 2)…")
-        outcome = run_review(plan, output_dir)
+        outcome = run_review(plan, output_dir, remux_tools=remux_tools)
         if outcome == "proceed":
             typer.secho("Moves completed.", fg=typer.colors.GREEN)
             _maybe_cleanup_source(input_dir, cleanup)
@@ -152,6 +183,23 @@ def main(
         raise typer.Exit(130) from None
     finally:
         tmdb.close()
+
+
+def _ensure_remux_tools_available(tools: RemuxTools) -> None:
+    """Exit with a clear message when --convert-for-streaming is on but tools are missing."""
+    missing = check_tools(tools)
+    if not missing:
+        return
+    raise SystemExit(
+        "--convert-for-streaming is enabled but required tool(s) were not found: "
+        + ", ".join(missing)
+        + "\n"
+        "Install them and retry:\n"
+        "  brew install ffmpeg mkvtoolnix   # provides ffmpeg, ffprobe, mkvmerge\n"
+        "  dovi_tool: https://github.com/quietvoid/dovi_tool/releases\n"
+        "Non-PATH locations can be set in titleforge.conf via FFMPEG_PATH, "
+        "FFPROBE_PATH, DOVI_TOOL_PATH, MKVMERGE_PATH."
+    )
 
 
 def _maybe_cleanup_source(input_dir: Path, cleanup: bool | None) -> None:

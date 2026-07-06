@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from typing import Callable
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -11,7 +12,9 @@ from textual.widgets import Button, DataTable, Footer, Input, Label
 
 from rich.text import Text
 
+from titleforge import remux
 from titleforge.models import PlanEntry, RenamePlan
+from titleforge.remux import RemuxTools
 from titleforge.sidecars import find_sidecars, sidecar_dest
 
 
@@ -54,11 +57,18 @@ class ReviewApp(App[None]):
         Binding("q", "cancel", "Quit", show=False),
     ]
 
-    def __init__(self, plan: RenamePlan, output_root: Path) -> None:
+    def __init__(
+        self,
+        plan: RenamePlan,
+        output_root: Path,
+        remux_tools: RemuxTools | None = None,
+    ) -> None:
         super().__init__()
         self.plan = plan
         self.output_root = output_root.resolve()
+        self.remux_tools = remux_tools
         self._done: str = "cancel"
+        self._moving = False
 
     def compose(self) -> ComposeResult:
         yield Label(
@@ -124,6 +134,8 @@ class ReviewApp(App[None]):
         return None
 
     def action_proceed(self) -> None:
+        if self._moving:
+            return
         dup = self._check_duplicate_dests()
         if dup:
             self.notify(dup, severity="error", timeout=10)
@@ -138,6 +150,27 @@ class ReviewApp(App[None]):
                 self.notify(f"Refusing overwrite existing file:\n{dest}", severity="error", timeout=10)
                 return
 
+        if self.remux_tools is not None:
+            # DV7 remuxes run minutes-to-hours (up to ~100 GB over a share):
+            # do the moves in a thread worker so the TUI stays responsive.
+            self._moving = True
+            self.run_worker(self._perform_moves_in_worker, thread=True)
+        else:
+            self._perform_moves(self.notify)
+            self._done = "proceed"
+            self.exit()
+
+    def _perform_moves_in_worker(self) -> None:
+        def notify(message: str, **kwargs: object) -> None:
+            self.call_from_thread(self.notify, message, **kwargs)
+
+        try:
+            self._perform_moves(notify)
+            self._done = "proceed"
+        finally:
+            self.call_from_thread(self.exit)
+
+    def _perform_moves(self, notify: Callable[..., None]) -> None:
         sidecar_count = 0
         for e in self.plan.entries:
             if e.kind == "skipped" or e.dest is None:
@@ -150,7 +183,8 @@ class ReviewApp(App[None]):
             # parent won't have them anymore, and we want to preserve language
             # / `.forced` tag suffixes that hang off the source stem.
             sidecars = find_sidecars(e.src)
-            shutil.move(str(e.src), str(dest))
+            if not self._maybe_remux_dv7(e.src, dest, notify):
+                shutil.move(str(e.src), str(dest))
             for sc in sidecars:
                 sc_dest = sidecar_dest(sc, e.src, dest)
                 if sc_dest.exists():
@@ -161,25 +195,66 @@ class ReviewApp(App[None]):
                     sidecar_count += 1
                 except OSError:
                     # Best-effort: a failed sidecar move shouldn't tank the run.
-                    self.notify(
+                    notify(
                         f"Could not move sidecar:\n{sc}", severity="warning", timeout=6
                     )
 
         if sidecar_count:
-            self.notify(
+            notify(
                 f"Moved {sidecar_count} sidecar file(s) alongside their videos.",
                 severity="information",
                 timeout=4,
             )
-        self._done = "proceed"
-        self.exit()
+
+    def _maybe_remux_dv7(
+        self, src: Path, dest: Path, notify: Callable[..., None]
+    ) -> bool:
+        """DV7→DV8.1 remux hook, run per entry before the plain move.
+
+        Returns True when the remuxed file already landed at *dest* (and the
+        original was deleted). Returns False when the caller should move the
+        original unchanged — either remuxing is disabled, the file isn't DV
+        profile 7, or the remux failed (in which case playability is no worse
+        than today). A remux failure never aborts the whole run.
+        """
+        if self.remux_tools is None:
+            return False
+        if not remux.is_dv7_mkv(src, self.remux_tools.ffprobe):
+            return False
+        tmp = src.parent / f".{src.stem}.dv8.tmp.mkv"
+        notify(f"Remuxing {src.name} (DV7→DV8.1)…", severity="information", timeout=8)
+        try:
+            remux.remux_dv7_to_dv8(src, tmp, self.remux_tools)
+        except remux.RemuxError as err:
+            notify(
+                f"DV7 remux failed — moving the original unchanged:\n{err}",
+                severity="warning",
+                timeout=10,
+            )
+            return False
+        # Verified success: the remux replaces the original in the library.
+        shutil.move(str(tmp), str(dest))
+        try:
+            src.unlink()
+        except OSError:
+            notify(
+                f"Remuxed file placed, but could not delete the original:\n{src}",
+                severity="warning",
+                timeout=8,
+            )
+        notify(f"Remuxed {src.name} (DV7→DV8.1)", severity="information", timeout=4)
+        return True
 
     @property
     def outcome(self) -> str:
         return self._done
 
 
-def run_review(plan: RenamePlan, output_root: Path) -> str:
-    app = ReviewApp(plan, output_root)
+def run_review(
+    plan: RenamePlan,
+    output_root: Path,
+    remux_tools: RemuxTools | None = None,
+) -> str:
+    app = ReviewApp(plan, output_root, remux_tools=remux_tools)
     app.run()
     return app.outcome

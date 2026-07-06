@@ -58,6 +58,27 @@ Phase 1 resolves every video; Phase 2 shows a scrollable plan (source → destin
 
 Episodic content is placed under `Series/`; movies under `Movies/`. The **primary** movie or series folder name includes `{tmdb-<id>}` (movie filenames inside that folder do not repeat the id). Legacy `[tmdb-<id>]` paths are still recognized for skip detection.
 
+### Convert for streaming (`--convert-for-streaming`)
+
+Opt-in: convert files for streaming compatibility during the Phase 2 moves. Currently this performs one conversion — a **lossless Dolby Vision profile 7 → 8.1 remux** — but the flag is the umbrella for future streaming-compatibility conversions.
+
+DV profile 7 `.mkv` files (dual-layer BL+EL, typical of UHD Blu-ray rips) break playback when streamed: browsers can't decode them stream-copied, Plex's transcoder fails on the profile-7 RPU, and streaming devices only implement single-layer profiles 5/8. The remux copies the HEVC base layer bit-for-bit, converts the dynamic DV metadata to profile 8.1, drops the enhancement layer (which no consumer streaming device decodes), and keeps all audio/subtitles/chapters/attachments.
+
+```bash
+titleforge -i /path/to/inbox -o /path/to/library --convert-for-streaming
+```
+
+- Enable persistently with **`CONVERT_FOR_STREAMING=true`** in `titleforge.conf`; the CLI flags win (`--no-convert-for-streaming` overrides the config key).
+- Only DV profile 7 `.mkv` files are converted; everything else moves unchanged. Each converted file is **verified** (profile 8 metadata, duration, stream counts) before the original is replaced; on any failure the original is moved unchanged — playability is never worse than before.
+- Required tools (checked up front): `ffmpeg`, `ffprobe`, `mkvmerge`, and `dovi_tool`.
+
+```bash
+brew install ffmpeg mkvtoolnix   # provides ffmpeg, ffprobe, mkvmerge
+# dovi_tool: download a release binary from https://github.com/quietvoid/dovi_tool/releases
+```
+
+Non-PATH locations can be set in `titleforge.conf` (or the environment) via **`FFMPEG_PATH`**, **`FFPROBE_PATH`**, **`DOVI_TOOL_PATH`**, **`MKVMERGE_PATH`**.
+
 ## For maintainers
 
 End users only need **Install** (including **Configuration**) and **Usage** above.

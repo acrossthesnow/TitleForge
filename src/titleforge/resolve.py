@@ -1747,8 +1747,80 @@ def build_plan(
     entries: list[PlanEntry] = []
     for p in sorted(files, key=lambda x: str(x).lower()):
         entries.append(resolve_path(p, output_root, tmdb, ctx, ignore_tmdb=ignore_tmdb))
+    _flag_destination_conflicts(entries, ctx)
     labels = _build_entity_labels(entries, ctx)
     return RenamePlan(entries=entries, labels=labels)
+
+
+_TMDB_TAG_IN_NAME = re.compile(r"\s*\{tmdb-\d+\}")
+
+
+def _conflict_title_from_dest(dest: Path) -> str:
+    """Series / movie title for a conflict label, from the destination's
+    ``{tmdb-…}``-tagged folder."""
+    for p in dest.parents:
+        if "{tmdb-" in p.name:
+            return _TMDB_TAG_IN_NAME.sub("", p.name).strip()
+    return dest.stem
+
+
+def _flag_destination_conflicts(entries: list[PlanEntry], ctx: PlanContext) -> None:
+    """Surface destination collisions in Phase 1.5 instead of letting them hide
+    inside entity groups until Phase 2's Proceed guard refuses the whole plan.
+
+    Two kinds: several plan entries sharing one destination (the same episode
+    ripped into a pack *and* a crossovers folder), and a destination that
+    already exists on disk from an earlier run. Affected entries are pulled out
+    of their entity grouping into their own rows with LOW confidence (low sorts
+    first in the search-review table) and noticed on stderr at plan time.
+    """
+    by_dest: dict[Path, list[PlanEntry]] = {}
+    for e in entries:
+        if e.dest is None or e.kind == "skipped":
+            continue
+        by_dest.setdefault(e.dest.resolve(), []).append(e)
+    for dest, group in sorted(by_dest.items()):
+        srcs = {e.src.resolve() for e in group}
+        dup = len(srcs) > 1
+        exists = dest.exists()
+        if exists and len(srcs) == 1:
+            try:
+                # A file already sitting at its own destination is not a conflict.
+                exists = not dest.samefile(next(iter(srcs)))
+            except OSError:
+                pass
+        if not dup and not exists:
+            continue
+        if dup:
+            names = " + ".join(sorted(e.src.name for e in group))
+            _user_notice(None, f"Duplicate destination ({len(group)} files): {dest} <- {names}")
+        if exists:
+            _user_notice(None, f"Destination already exists on disk: {dest}")
+        for e in group:
+            bits: list[str] = []
+            if dup:
+                rivals = sorted(o.src.name for o in group if o.src != e.src)
+                bits.append(f"duplicate destination — also from {', '.join(rivals)}")
+            if exists:
+                bits.append("destination already exists on disk")
+            msg = "; ".join(bits)
+            e.note = msg if not e.note else f"{e.note}; {msg}"
+            # Own row in the search-review table — otherwise a pack member's
+            # collision stays invisible inside the entity's "54 files" row.
+            e.entity_key = e.src.resolve()
+            prior = ctx.per_file_label.get(e.src)
+            kind: Literal["movie", "tv", "skipped"] = (
+                "movie" if (e.tmdb_movie_id or e.kind == "movie") else "tv"
+            )
+            ctx.per_file_label[e.src] = _PerFileLabel(
+                kind=kind,
+                tmdb_id=e.tmdb_tv_id or e.tmdb_movie_id,
+                title=prior.title if prior is not None else _conflict_title_from_dest(dest),
+                year=prior.year if prior is not None else None,
+                confidence="low",
+                reason=msg if prior is None else f"{msg} ({prior.reason})",
+                candidates=list(prior.candidates) if prior is not None else [],
+            )
 
 
 _CONFIDENCE_RANK: dict[ConfidenceLevel, int] = {"low": 0, "medium": 1, "high": 2}

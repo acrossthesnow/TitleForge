@@ -113,15 +113,22 @@ class ReviewApp(App[None]):
         self.exit()
 
     def _check_duplicate_dests(self) -> str | None:
-        seen: dict[Path, Path] = {}
+        by_dest: dict[Path, list[Path]] = {}
         for e in self.plan.entries:
             if e.dest is None or e.kind == "skipped":
                 continue
-            d = e.dest.resolve()
-            if d in seen and seen[d] != e.src.resolve():
-                return f"Duplicate destination:\n{d}\n{seen[d]}\n{e.src}"
-            seen[d] = e.src.resolve()
-        return None
+            by_dest.setdefault(e.dest.resolve(), []).append(e.src.resolve())
+        dups = {d: srcs for d, srcs in by_dest.items() if len(set(srcs)) > 1}
+        if not dups:
+            return None
+        lines = [
+            f"{len(dups)} duplicate destination(s) — skip or edit one copy per group "
+            "(flagged as LOW 'duplicate destination' rows in the search review):"
+        ]
+        for d, srcs in sorted(dups.items()):
+            lines.append(str(d))
+            lines.extend(f"  <- {s}" for s in sorted(set(srcs)))
+        return "\n".join(lines)
 
     def action_proceed(self) -> None:
         dup = self._check_duplicate_dests()

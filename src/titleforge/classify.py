@@ -90,10 +90,25 @@ def series_prefix_from_stem(stem: str) -> str | None:
     episode marker, cleaned. ``"1. The ZETA Project - S01 E08 - Shadows (…)"``
     → ``"The ZETA Project"``. Returns ``None`` when the stem has no marker or
     nothing usable precedes it (``"S01E01 - Pilot"``) — the episode title after
-    the marker must never leak into a TV search query."""
-    from titleforge.normalize import _LEAD_ENUM, strip_release_info, trim_stranded_separators
+    the marker must never leak into a TV search query.
 
-    s = _LEAD_ENUM.sub("", stem)
+    Year groups are dropped (``"Firefly (2002) - S01E12"`` → ``"Firefly"``) but
+    other parenthesized title parts survive (``"JUSTICE LEAGUE (Unlimited)"``),
+    which is why this uses non-aggressive release stripping."""
+    from titleforge.normalize import (
+        _LEAD_SQ_GROUP,
+        strip_leading_enum,
+        strip_release_info,
+        strip_year_groups,
+        trim_stranded_separators,
+    )
+
+    s = strip_leading_enum(stem)
+    while True:
+        stripped = _LEAD_SQ_GROUP.sub("", s)
+        if stripped == s:
+            break
+        s = stripped
     cut = None
     for rx in _EP_MARKERS:
         m = rx.search(s)
@@ -101,25 +116,33 @@ def series_prefix_from_stem(stem: str) -> str | None:
             cut = m.start()
     if cut is None:
         return None
-    prefix = strip_release_info(s[:cut], aggressive=True)
+    prefix = strip_year_groups(s[:cut])
+    prefix = strip_release_info(prefix, aggressive=False)
     prefix = trim_stranded_separators(prefix)
     return prefix or None
 
 
 def series_query_string(path: Path) -> str:
     """Derive a TMDB TV search string from folder / filename."""
-    from titleforge.normalize import strip_release_info, title_prefix
+    from titleforge.normalize import (
+        strip_leading_enum,
+        strip_release_info,
+        title_prefix,
+        trim_stranded_separators,
+    )
 
     # Parent folder: title prefix before the first junk boundary; fall back to
-    # the legacy subtractive cleaning when the name *starts* with junk.
+    # the legacy subtractive cleaning when the name *starts* with junk. Both
+    # paths shed enumeration prefixes and stranded separators so lettered
+    # folders ("a. Season 1 (1999)") can never survive as a one-letter query.
     parent_name = path.parent.name
     if parent_name:
         parent = title_prefix(parent_name)
         if not parent:
-            parent = strip_release_info(parent_name, aggressive=True)
+            parent = strip_release_info(strip_leading_enum(parent_name), aggressive=True)
             parent = re.sub(r"(?i)\bS\d{1,4}\b", " ", parent)
             parent = re.sub(r"(?i)\bSeason\s*\d{1,4}\b", " ", parent)
-            parent = re.sub(r"\s+", " ", parent).strip()
+            parent = trim_stranded_separators(parent)
         if parent:
             return parent
     # Filename: the series name is the text BEFORE the episode marker — never

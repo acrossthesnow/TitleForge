@@ -26,6 +26,7 @@ from titleforge.nfo import collect_ids_near_video
 from titleforge.normalize import (
     basename_terms,
     parent_folder_term,
+    strip_leading_enum,
     strip_release_info,
     title_prefix,
     trim_stranded_separators,
@@ -110,6 +111,9 @@ class PlanContext:
     # search via series_by_root) can render `Series (YYYY)` on their label
     # without an extra TMDB round-trip.
     series_year_by_tv_id: dict[int, int | None] = field(default_factory=dict)
+    # Group-root -> (consensus prefix | None, distinct prefix count) from member
+    # filenames; computed lazily by resolve_episode's mixed-folder guard.
+    root_prefix_census: dict[Path, tuple[str | None, int]] = field(default_factory=dict)
 
     def get_season_json(self, tmdb: TmdbClient, tv_id: int, season: int) -> dict[str, Any]:
         key = (tv_id, season)
@@ -239,13 +243,14 @@ def _compute_missing(
     return ", ".join(parts)
 
 
-def _consensus_series_prefix(files: list[Path]) -> str | None:
-    """Most common filename-derived series prefix across episode-bearing members.
+def _prefix_census(files: list[Path]) -> tuple[str | None, int]:
+    """(consensus prefix, distinct prefix count) across episode-bearing members.
 
     52 files that all start ``STATIC SHOCK - Sxx Eyy`` are a stronger series
-    signal than any folder name. Requires at least two agreeing files covering
-    ≥70% of the members that have a usable prefix, so mixed-series folders
-    (crossover collections) and junk filenames never produce a consensus.
+    signal than any folder name. Consensus requires at least two agreeing files
+    covering ≥70% of the members with a usable prefix. Several disagreeing
+    prefixes (a crossover collection) yield ``(None, N)`` so callers can treat
+    the folder as *mixed* instead of stamping one show onto everything.
     """
     counts: dict[str, int] = {}
     display: dict[str, str] = {}
@@ -259,11 +264,15 @@ def _consensus_series_prefix(files: list[Path]) -> str | None:
         counts[key] = counts.get(key, 0) + 1
         display.setdefault(key, prefix)
     if not counts:
-        return None
+        return None, 0
     top = max(counts, key=lambda k: counts[k])
     if counts[top] >= 2 and counts[top] / sum(counts.values()) >= 0.7:
-        return display[top]
-    return None
+        return display[top], len(counts)
+    return None, len(counts)
+
+
+def _name_similarity(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 
 def prepare_pack_tv_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root: Path) -> None:
@@ -283,21 +292,42 @@ def prepare_pack_tv_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root: Path
         # *starts* with junk and there is no prefix to extract.
         query = title_prefix(entity.name)
         if not query:
-            query = (cleaned.title or cleaned.raw_stem or entity.name).strip()
+            # Enum-strip the RAW name before cleaning — clean_stem_for_search
+            # collapses "a. Season 1" to "a" and the enumeration punctuation is
+            # gone by the time the title comes back.
+            legacy = clean_stem_for_search(strip_leading_enum(entity.name))
+            query = (legacy.title or legacy.raw_stem or entity.name).strip()
             query = re.sub(
                 r"(?i)\b(S\d{1,4}|Season\s*\d{1,4}|Complete(?:\s*Series)?)\b", " ", query
             )
             query = trim_stranded_separators(query)
         if not query:
             continue
+        consensus, distinct = _prefix_census(subset)
+        if consensus is None and distinct >= 2:
+            # Member filenames name several different series (a crossover
+            # collection shipped as one folder): binding a single show would
+            # stamp it onto all of them. Resolve per-file instead.
+            _user_notice(
+                entity,
+                f"Pack TV: member filenames name {distinct} different series; "
+                "files will resolve individually (review in Phase 1.5).",
+            )
+            continue
         # Retry ladder: folder-derived query first (so a sane folder name keeps
         # driving the search), then the consensus series prefix across member
         # filenames, then the same candidates without the year filter. Later
-        # rungs only run when the previous one returned nothing.
-        consensus = _consensus_series_prefix(subset)
+        # rungs only run when the previous one returned nothing — except when
+        # the folder name has nothing in common with what the files call the
+        # show; then the consensus searches first, so an unrelated folder name
+        # that happens to match *something* on TMDB can't win by accident.
         rungs: list[tuple[str, int | None, str]] = [(query, cleaned.year, "folder name")]
         if consensus and consensus.lower() != query.lower():
-            rungs.append((consensus, cleaned.year, "filename consensus"))
+            rung = (consensus, cleaned.year, "filename consensus")
+            if _name_similarity(consensus, query) < 0.5:
+                rungs.insert(0, rung)
+            else:
+                rungs.append(rung)
         if cleaned.year is not None:
             rungs.extend((q, None, f"{src}, no year filter") for q, _y, src in list(rungs))
         results: list[dict[str, Any]] = []
@@ -341,11 +371,13 @@ def prepare_pack_tv_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root: Path
         if picked is None:
             continue
         pick, confidence, reason, candidates = picked
-        if degraded:
-            # A fallback rung matched, not the folder name itself — surface it
-            # in Phase 1.5 rather than silently trusting the lucky hit.
-            reason = f"{reason}; matched via {used_src} {used_query!r}"
-            if confidence == "high":
+        if used_src != "folder name":
+            # Surface non-folder query sources in Phase 1.5. Only a *fallback*
+            # rung (something already failed first) caps confidence — a
+            # front-loaded consensus is the strongest signal available, not a
+            # degraded one.
+            reason = f"{reason}; query from {used_src} {used_query!r}"
+            if degraded and confidence == "high":
                 confidence = "medium"
         tv_id = int(pick["id"])
         detail = tmdb.tv_detail(tv_id)
@@ -587,6 +619,18 @@ def resolve_pack_tv_member(
     # Real episode under the bound show — finalize with the pack binding directly
     # to avoid the redundant TMDB show search that resolve_episode would do.
     if looks_episode(path) or guess_kind(path) == "episode":
+        prefix = series_prefix_from_stem(path.stem)
+        if prefix and _name_similarity(prefix, series_name) < 0.5:
+            # The file names a different show than the pack binding (Static
+            # Shock packs shipping JLU "TRUE Ending" episodes): stamping the
+            # pack id would rename it into the wrong series — and collide with
+            # the real owner of that SxxEyy slot. Resolve it as its own series.
+            _user_notice(
+                path,
+                f"Pack member names a different series ({prefix!r} vs bound "
+                f"{series_name!r}); resolving individually.",
+            )
+            return resolve_episode(path, output_root, tmdb, ctx)
         return _finalize_episode(path, output_root, tmdb, ctx, tv_id, series_name)
 
     season = infer_season_from_path_ancestors(path, entity)
@@ -1471,39 +1515,66 @@ def resolve_episode(
 
     if resolved_tv is None:
         query = series_query_string(path)
+        consensus: str | None = None
+        mixed_folder = False
         if root is not None:
+            census = ctx.root_prefix_census.get(root)
+            if census is None:
+                members = [f for f in ctx.all_files if _path_is_within(root, f)]
+                census = _prefix_census(members)
+                ctx.root_prefix_census[root] = census
+            consensus, distinct = census
+            mixed_folder = consensus is None and distinct >= 2
             # Title prefix of the group folder ("Pantheon.S01.…" → "Pantheon");
             # legacy subtractive cleaning only when the folder name starts with
             # junk. Mirrors prepare_pack_tv_resolve so loose episodes get the
-            # same cleanup pack-bound ones already get.
-            qn = title_prefix(root.name)
-            if not qn:
-                qn = strip_release_info(root.name, aggressive=True)
-                qn = re.sub(
-                    r"(?i)\b(S\d{1,4}|Season\s*\d{1,4}|Complete(?:\s*Series)?)\b",
-                    " ",
-                    qn,
-                )
-                qn = trim_stranded_separators(qn)
-            if qn:
-                query = qn
+            # same cleanup pack-bound ones already get. Skipped entirely for
+            # mixed folders (crossover collections): their name describes no
+            # single show, so each file must search as itself.
+            if not mixed_folder:
+                qn = title_prefix(root.name)
+                if not qn:
+                    qn = strip_release_info(strip_leading_enum(root.name), aggressive=True)
+                    qn = re.sub(
+                        r"(?i)\b(S\d{1,4}|Season\s*\d{1,4}|Complete(?:\s*Series)?)\b",
+                        " ",
+                        qn,
+                    )
+                    qn = trim_stranded_separators(qn)
+                if qn:
+                    query = qn
         stem_cleaned = clean_stem_for_search(path.stem)
         # Retry ladder: the folder/primary query, then the series prefix from
-        # this file's own name, then first " - " segments of each. Later rungs
-        # only run on zero results, so a good first query costs nothing extra.
+        # this file's own name, then first " - " segments and bracket-inlined
+        # variants of each. Later rungs only run on zero results, so a good
+        # first query costs nothing extra.
         # Each rung is (candidate, per_file): per_file marks queries derived
         # from THIS file's name rather than the shared folder — a hit on one of
         # those says nothing about sibling files, so it must never be cached as
         # the folder's series identity below. Dedupe keeps the first occurrence,
         # so when folder and filename agree the rung stays folder-derived.
-        raw_rungs: list[tuple[str, bool]] = [(query, False)]
         stem_prefix = series_prefix_from_stem(path.stem)
-        if stem_prefix:
+        raw_rungs: list[tuple[str, bool]] = [(query, False)]
+        if mixed_folder and stem_prefix:
+            # Mixed folder: the file's own series name is the only real signal.
+            raw_rungs = [(stem_prefix, True)]
+        elif stem_prefix:
             raw_rungs.append((stem_prefix, True))
+        if consensus and not mixed_folder and _name_similarity(consensus, query) < 0.5:
+            # Folder name has nothing in common with what the member files call
+            # the show ("TRUE Ending (2005)" holding JLU episodes): search the
+            # consensus first so an unrelated folder name that happens to match
+            # something on TMDB can't win by accident.
+            raw_rungs.insert(0, (consensus, False))
         for cand, per_file in list(raw_rungs):
             seg = cand.split(" - ")[0].strip()
             if seg:
                 raw_rungs.append((seg, per_file))
+        for cand, per_file in list(raw_rungs):
+            if re.search(r"[()\[\]{}]", cand):
+                inlined = re.sub(r"\s+", " ", re.sub(r"[()\[\]{}]", " ", cand)).strip()
+                if inlined:
+                    raw_rungs.append((inlined, per_file))
         seen: set[str] = set()
         ladder: list[tuple[str, bool]] = []
         for cand, per_file in raw_rungs:
@@ -1582,10 +1653,11 @@ def resolve_episode(
         series_name = detail.get("name") or detail.get("original_name") or "Series"
         ctx.series_year_by_tv_id[tv_id] = _year_from_tv_search_row(detail)
         resolved_tv = (tv_id, series_name)
-        # Cache on the folder only when the winning query was folder-derived.
-        # A filename-rung match in a mixed folder (crossover collections) would
-        # otherwise stamp file #1's show onto every sibling.
-        if root is not None and not used_per_file:
+        # Cache on the folder only when the winning query was folder-derived
+        # and the folder is not mixed. A filename-rung match in a mixed folder
+        # (crossover collections) would otherwise stamp file #1's show onto
+        # every sibling.
+        if root is not None and not used_per_file and not mixed_folder:
             ctx.series_by_root[root] = resolved_tv
         ctx.per_file_label[path] = _PerFileLabel(
             kind="tv",

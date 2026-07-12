@@ -101,9 +101,12 @@ _SEASON_TOKEN = re.compile(r"(?i)\bS\d{1,4}\b")
 # Bare "Complete" ("Complete ANIMATED TV Series") — _PACK_RANGE only catches it
 # when directly followed by series/show/pack/collection.
 _COMPLETE_WORD = re.compile(r"(?i)\bcomplete\b")
-# Leading enumeration on curated packs: "1. The ZETA Project - …". Requires the
+# Leading enumeration on curated packs: "1. The ZETA Project - …" and lettered
+# subfolders "a. Season 1 (1999)" / "e. Crossovers (2001-05)". Requires the
 # separator punctuation AND whitespace so "24 - S01E01" / "9.S01E01" survive.
-_LEAD_ENUM = re.compile(r"^\s*\d{1,3}\s*[.)]\s+")
+# Known trade-off: a title written as "B. The Beginning" loses its "B. " — rare
+# vs. the enumerated-folder uploads seen in the wild, and Phase 1.5 catches it.
+_LEAD_ENUM = re.compile(r"^\s*(?:\d{1,3}|[A-Za-z])\s*[.)]\s+")
 # Leading square-bracket release group ("[Judas] Show …"). Square brackets only:
 # leading parens can be a real title ("(500) Days of Summer").
 _LEAD_SQ_GROUP = re.compile(r"^\s*\[[^\]]*\]\s*")
@@ -113,6 +116,21 @@ _TITLE_BOUNDARIES = (_PACK_RANGE, _RESOLUTION, _BRACKET_YEAR, _SEASON_TOKEN, _CO
 # Chars that count as "dangling separator" when left at either end after junk
 # removal ("STATIC SHOCK - " → "STATIC SHOCK").
 _DANGLING_EDGE = " \t-–—_,&+:;."
+
+
+# Bracketed group that starts with a year: "(2002)", "(2001-05)", "[1999] HD".
+_YEAR_GROUP = re.compile(r"[(\[{]\s*(?:19|20)\d{2}[^)\]}]*[)\]}]")
+
+
+def strip_leading_enum(name: str) -> str:
+    """Drop a leading list-enumeration prefix: ``"1. Show"`` / ``"e. Crossovers"``."""
+    return _LEAD_ENUM.sub("", name)
+
+
+def strip_year_groups(s: str) -> str:
+    """Remove bracketed groups that open with a year — ``"Firefly (2002) - "``
+    → ``"Firefly  - "`` — while leaving title parens like ``"(Unlimited)"``."""
+    return _YEAR_GROUP.sub(" ", s)
 
 
 def trim_stranded_separators(s: str) -> str:
@@ -132,7 +150,7 @@ def title_prefix(name: str) -> str:
     name *starts* with junk (e.g. ``"SEASON 1 (2000-2001)"``) — callers fall
     back to their legacy cleaning or a filename-derived query.
     """
-    s = _LEAD_ENUM.sub("", name)
+    s = strip_leading_enum(name)
     while True:
         stripped = _LEAD_SQ_GROUP.sub("", s)
         if stripped == s:

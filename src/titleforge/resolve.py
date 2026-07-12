@@ -11,11 +11,25 @@ from typing import Any, Literal, TypeVar
 import questionary
 from questionary import Style
 
-from titleforge.classify import _S00E00, guess_kind, looks_episode, looks_movie, parse_sxe, series_query_string
+from titleforge.classify import (
+    _S00E00,
+    guess_kind,
+    looks_episode,
+    looks_movie,
+    parse_sxe,
+    series_prefix_from_stem,
+    series_query_string,
+)
 from titleforge.extra_category import infer_plex_extra_folder
 from titleforge.models import ConfidenceLevel, EntityLabel, PlanEntry, RenamePlan
 from titleforge.nfo import collect_ids_near_video
-from titleforge.normalize import basename_terms, parent_folder_term, strip_release_info
+from titleforge.normalize import (
+    basename_terms,
+    parent_folder_term,
+    strip_release_info,
+    title_prefix,
+    trim_stranded_separators,
+)
 from titleforge.pack import (
     entity_roots_under_input,
     infer_season_from_path_ancestors,
@@ -225,6 +239,33 @@ def _compute_missing(
     return ", ".join(parts)
 
 
+def _consensus_series_prefix(files: list[Path]) -> str | None:
+    """Most common filename-derived series prefix across episode-bearing members.
+
+    52 files that all start ``STATIC SHOCK - Sxx Eyy`` are a stronger series
+    signal than any folder name. Requires at least two agreeing files covering
+    ≥70% of the members that have a usable prefix, so mixed-series folders
+    (crossover collections) and junk filenames never produce a consensus.
+    """
+    counts: dict[str, int] = {}
+    display: dict[str, str] = {}
+    for f in files:
+        if parse_sxe(f) is None:
+            continue
+        prefix = series_prefix_from_stem(f.stem)
+        if not prefix:
+            continue
+        key = prefix.lower()
+        counts[key] = counts.get(key, 0) + 1
+        display.setdefault(key, prefix)
+    if not counts:
+        return None
+    top = max(counts, key=lambda k: counts[k])
+    if counts[top] >= 2 and counts[top] / sum(counts.values()) >= 0.7:
+        return display[top]
+    return None
+
+
 def prepare_pack_tv_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root: Path) -> None:
     """
     One TV series pick per **first-level folder** under ``--input`` when that subtree
@@ -237,31 +278,59 @@ def prepare_pack_tv_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root: Path
         if not is_single_tv_pack(subset, entity):
             continue
         cleaned = clean_stem_for_search(entity.name)
-        query = (cleaned.title or cleaned.raw_stem or entity.name).strip()
-        # Strip season / series-pack hints baked into the folder name so e.g.
-        # `Firefly (2002) Season 1 S01 (1080p ...)` searches as `Firefly`.
-        query = re.sub(r"(?i)\b(S\d{1,4}|Season\s*\d{1,4}|Complete(?:\s*Series)?)\b", " ", query)
-        query = re.sub(r"\s+", " ", query).strip()
+        # Title prefix before the first junk boundary ("STATIC SHOCK (2000-…" →
+        # "STATIC SHOCK"); legacy subtractive cleaning only when the name
+        # *starts* with junk and there is no prefix to extract.
+        query = title_prefix(entity.name)
+        if not query:
+            query = (cleaned.title or cleaned.raw_stem or entity.name).strip()
+            query = re.sub(
+                r"(?i)\b(S\d{1,4}|Season\s*\d{1,4}|Complete(?:\s*Series)?)\b", " ", query
+            )
+            query = trim_stranded_separators(query)
         if not query:
             continue
-        try:
-            results = tmdb.search_tv(query, cleaned.year)
-        except TmdbAuthError:
-            raise
-        except Exception:
-            continue
-        results = _dedupe_tv(results)
+        # Retry ladder: folder-derived query first (so a sane folder name keeps
+        # driving the search), then the consensus series prefix across member
+        # filenames, then the same candidates without the year filter. Later
+        # rungs only run when the previous one returned nothing.
+        consensus = _consensus_series_prefix(subset)
+        rungs: list[tuple[str, int | None, str]] = [(query, cleaned.year, "folder name")]
+        if consensus and consensus.lower() != query.lower():
+            rungs.append((consensus, cleaned.year, "filename consensus"))
+        if cleaned.year is not None:
+            rungs.extend((q, None, f"{src}, no year filter") for q, _y, src in list(rungs))
+        results: list[dict[str, Any]] = []
+        used_query, used_src, degraded = query, "folder name", False
+        for i, (q, y, src) in enumerate(rungs):
+            try:
+                results = _dedupe_tv(tmdb.search_tv(q, y))
+            except TmdbAuthError:
+                raise
+            except Exception:
+                results = []
+            if results:
+                used_query, used_src, degraded = q, src, i > 0
+                break
+            if i + 1 < len(rungs):
+                nq, ny, _ns = rungs[i + 1]
+                yn = f" (year filter {y})" if y else ""
+                nyn = f" (year filter {ny})" if ny else ""
+                _user_notice(
+                    entity,
+                    f"Pack TV search: no results for {q!r}{yn}; retrying with {nq!r}{nyn}.",
+                )
         y_note = f" (year filter {cleaned.year})" if cleaned.year else ""
-        pack_label = query
         if not results:
             # Phase 1 is silent — defer to the Phase 1.5 search-review UI where
             # the user can drop into prompt_search_with_type via the edit action.
             _user_notice(
                 entity,
-                f"Pack TV search: no results for {pack_label!r}{y_note}; "
+                f"Pack TV search: no results for {query!r}{y_note}; "
                 "files will resolve individually (review in Phase 1.5).",
             )
             continue
+        pack_label = used_query
         picked = _auto_pick(
             results,
             pack_label.lower(),
@@ -272,6 +341,12 @@ def prepare_pack_tv_resolve(ctx: PlanContext, tmdb: TmdbClient, input_root: Path
         if picked is None:
             continue
         pick, confidence, reason, candidates = picked
+        if degraded:
+            # A fallback rung matched, not the folder name itself — surface it
+            # in Phase 1.5 rather than silently trusting the lucky hit.
+            reason = f"{reason}; matched via {used_src} {used_query!r}"
+            if confidence == "high":
+                confidence = "medium"
         tv_id = int(pick["id"])
         detail = tmdb.tv_detail(tv_id)
         series_name = detail.get("name") or detail.get("original_name") or "Series"
@@ -1397,43 +1472,92 @@ def resolve_episode(
     if resolved_tv is None:
         query = series_query_string(path)
         if root is not None:
-            qn = strip_release_info(root.name, aggressive=True)
-            # Drop season hints baked into the folder name (`Pantheon S01`,
-            # `Show Season 1`, `Show Complete Series`) so the TMDB query is
-            # just the show title. Mirrors prepare_pack_tv_resolve so loose
-            # episodes get the same cleanup pack-bound ones already get.
-            qn = re.sub(
-                r"(?i)\b(S\d{1,4}|Season\s*\d{1,4}|Complete(?:\s*Series)?)\b",
-                " ",
-                qn,
-            )
-            qn = re.sub(r"\s+", " ", qn).strip()
+            # Title prefix of the group folder ("Pantheon.S01.…" → "Pantheon");
+            # legacy subtractive cleaning only when the folder name starts with
+            # junk. Mirrors prepare_pack_tv_resolve so loose episodes get the
+            # same cleanup pack-bound ones already get.
+            qn = title_prefix(root.name)
+            if not qn:
+                qn = strip_release_info(root.name, aggressive=True)
+                qn = re.sub(
+                    r"(?i)\b(S\d{1,4}|Season\s*\d{1,4}|Complete(?:\s*Series)?)\b",
+                    " ",
+                    qn,
+                )
+                qn = trim_stranded_separators(qn)
             if qn:
                 query = qn
         stem_cleaned = clean_stem_for_search(path.stem)
-        try:
-            results = tmdb.search_tv(query)
-        except TmdbAuthError:
-            raise
-        except Exception as e:
-            return PlanEntry(src=path, dest=None, kind="skipped", note=f"TV search error: {e}")
+        # Retry ladder: the folder/primary query, then the series prefix from
+        # this file's own name, then first " - " segments of each. Later rungs
+        # only run on zero results, so a good first query costs nothing extra.
+        # Each rung is (candidate, per_file): per_file marks queries derived
+        # from THIS file's name rather than the shared folder — a hit on one of
+        # those says nothing about sibling files, so it must never be cached as
+        # the folder's series identity below. Dedupe keeps the first occurrence,
+        # so when folder and filename agree the rung stays folder-derived.
+        raw_rungs: list[tuple[str, bool]] = [(query, False)]
+        stem_prefix = series_prefix_from_stem(path.stem)
+        if stem_prefix:
+            raw_rungs.append((stem_prefix, True))
+        for cand, per_file in list(raw_rungs):
+            seg = cand.split(" - ")[0].strip()
+            if seg:
+                raw_rungs.append((seg, per_file))
+        seen: set[str] = set()
+        ladder: list[tuple[str, bool]] = []
+        for cand, per_file in raw_rungs:
+            key = cand.lower()
+            if key and key not in seen:
+                seen.add(key)
+                ladder.append((cand, per_file))
 
-        results = _dedupe_tv(results)
+        results: list[dict[str, Any]] = []
+        used_query, used_per_file, degraded = ladder[0][0], False, False
+        last_error: Exception | None = None
+        for i, (cand, per_file) in enumerate(ladder):
+            try:
+                results = _dedupe_tv(tmdb.search_tv(cand))
+            except TmdbAuthError:
+                raise
+            except Exception as e:
+                last_error = e
+                results = []
+            if results:
+                used_query, used_per_file, degraded = cand, per_file, i > 0
+                break
+            if i + 1 < len(ladder):
+                _user_notice(
+                    path,
+                    f"No TMDB TV results for {cand!r}; retrying with {ladder[i + 1][0]!r}.",
+                )
+        if not results and last_error is not None:
+            return PlanEntry(
+                src=path, dest=None, kind="skipped", note=f"TV search error: {last_error}"
+            )
+
         if not results:
-            _user_notice(path, f"No TMDB TV results for {query!r}; review in Phase 1.5.")
+            tried = (
+                f" (also tried {', '.join(repr(c) for c, _pf in ladder[1:])})"
+                if len(ladder) > 1
+                else ""
+            )
+            _user_notice(
+                path, f"No TMDB TV results for {ladder[0][0]!r}{tried}; review in Phase 1.5."
+            )
             ctx.per_file_label[path] = _PerFileLabel(
                 kind="skipped",
                 tmdb_id=None,
-                title=query,
+                title=ladder[0][0],
                 year=stem_cleaned.year,
                 confidence="low",
-                reason=f"no TMDB TV hits for {query!r}",
+                reason=f"no TMDB TV hits for {ladder[0][0]!r}{tried}",
             )
             return PlanEntry(src=path, dest=None, kind="skipped", note="No TV results")
 
         picked = _auto_pick(
             results,
-            query.lower(),
+            used_query.lower(),
             lambda m: (m.get("name") or m.get("original_name") or ""),
             filename_year=stem_cleaned.year,
             extract_year=_year_from_tv_search_row,
@@ -1441,13 +1565,27 @@ def resolve_episode(
         if picked is None:
             return PlanEntry(src=path, dest=None, kind="skipped", note="No TV candidates")
         pick, confidence, reason, candidates = picked
+        if degraded:
+            # A fallback rung matched, not the primary query — log the pick now
+            # and cap confidence so it surfaces in the Phase 1.5 review.
+            reason = f"{reason}; matched via retry query {used_query!r}"
+            if confidence == "high":
+                confidence = "medium"
+            picked_name = pick.get("name") or pick.get("original_name") or "?"
+            _user_notice(
+                path,
+                f"[{confidence}] matched {picked_name!r} via retry query {used_query!r}.",
+            )
 
         tv_id = int(pick["id"])
         detail = tmdb.tv_detail(tv_id)
         series_name = detail.get("name") or detail.get("original_name") or "Series"
         ctx.series_year_by_tv_id[tv_id] = _year_from_tv_search_row(detail)
         resolved_tv = (tv_id, series_name)
-        if root is not None:
+        # Cache on the folder only when the winning query was folder-derived.
+        # A filename-rung match in a mixed folder (crossover collections) would
+        # otherwise stamp file #1's show onto every sibling.
+        if root is not None and not used_per_file:
             ctx.series_by_root[root] = resolved_tv
         ctx.per_file_label[path] = _PerFileLabel(
             kind="tv",

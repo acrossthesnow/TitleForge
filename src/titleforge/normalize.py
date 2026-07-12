@@ -85,6 +85,68 @@ def strip_release_info(name: str, aggressive: bool = True) -> str:
     return s
 
 
+# --- Title-prefix extraction -------------------------------------------------
+#
+# Real-world names put the title FIRST and the decoration after it, so the most
+# robust query is "everything before the first junk signal", not "whatever
+# survives junk deletion". The token regexes above (_PACK_RANGE / _RESOLUTION)
+# are reused here as boundary *detectors*: unknown junk after the first
+# recognized boundary costs nothing, which is what makes this degrade well on
+# folder names we've never seen.
+
+# Bracketed group that opens with a year — "(2000-2004)", "[1999]", "{2012".
+_BRACKET_YEAR = re.compile(r"[(\[{]\s*(?:19|20)\d{2}")
+# Bare season markers incl. ranges ("S01", "S01-S04"). \b keeps "S1m0ne" intact.
+_SEASON_TOKEN = re.compile(r"(?i)\bS\d{1,4}\b")
+# Bare "Complete" ("Complete ANIMATED TV Series") — _PACK_RANGE only catches it
+# when directly followed by series/show/pack/collection.
+_COMPLETE_WORD = re.compile(r"(?i)\bcomplete\b")
+# Leading enumeration on curated packs: "1. The ZETA Project - …". Requires the
+# separator punctuation AND whitespace so "24 - S01E01" / "9.S01E01" survive.
+_LEAD_ENUM = re.compile(r"^\s*\d{1,3}\s*[.)]\s+")
+# Leading square-bracket release group ("[Judas] Show …"). Square brackets only:
+# leading parens can be a real title ("(500) Days of Summer").
+_LEAD_SQ_GROUP = re.compile(r"^\s*\[[^\]]*\]\s*")
+
+_TITLE_BOUNDARIES = (_PACK_RANGE, _RESOLUTION, _BRACKET_YEAR, _SEASON_TOKEN, _COMPLETE_WORD)
+
+# Chars that count as "dangling separator" when left at either end after junk
+# removal ("STATIC SHOCK - " → "STATIC SHOCK").
+_DANGLING_EDGE = " \t-–—_,&+:;."
+
+
+def trim_stranded_separators(s: str) -> str:
+    """Collapse separator runs left behind by token removal and strip dangling
+    edge punctuation: ``"STATIC SHOCK - - "`` → ``"STATIC SHOCK"``."""
+    s = re.sub(r"(?:\s*[-–—]\s*){2,}", " - ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.strip(_DANGLING_EDGE)
+
+
+def title_prefix(name: str) -> str:
+    """Title text before the first junk boundary in a folder-ish name.
+
+    ``"STATIC SHOCK (2000-2004) - Complete ANIMATED …"`` → ``"STATIC SHOCK"``;
+    ``"Pantheon.S01.1080p.HIDI.WEB-DL"`` → ``"Pantheon"``. Names with no
+    recognized junk pass through cleaned but whole. Returns ``""`` when the
+    name *starts* with junk (e.g. ``"SEASON 1 (2000-2001)"``) — callers fall
+    back to their legacy cleaning or a filename-derived query.
+    """
+    s = _LEAD_ENUM.sub("", name)
+    while True:
+        stripped = _LEAD_SQ_GROUP.sub("", s)
+        if stripped == s:
+            break
+        s = stripped
+    cut = len(s)
+    for rx in _TITLE_BOUNDARIES:
+        m = rx.search(s)
+        if m is not None and m.start() < cut:
+            cut = m.start()
+    prefix = strip_release_info(s[:cut], aggressive=True)
+    return trim_stranded_separators(prefix)
+
+
 def basename_terms(path: Path) -> list[str]:
     """Candidate query strings from file stem."""
     stem = path.stem

@@ -82,17 +82,51 @@ def guess_kind(path: Path) -> KindGuess:
     return "ambiguous"
 
 
+_EP_MARKERS = (_S00E00, _NxNN, _SE_WORDS, _EP_PREFIX)
+
+
+def series_prefix_from_stem(stem: str) -> str | None:
+    """Series name from an episode filename: everything **before** the first
+    episode marker, cleaned. ``"1. The ZETA Project - S01 E08 - Shadows (…)"``
+    → ``"The ZETA Project"``. Returns ``None`` when the stem has no marker or
+    nothing usable precedes it (``"S01E01 - Pilot"``) — the episode title after
+    the marker must never leak into a TV search query."""
+    from titleforge.normalize import _LEAD_ENUM, strip_release_info, trim_stranded_separators
+
+    s = _LEAD_ENUM.sub("", stem)
+    cut = None
+    for rx in _EP_MARKERS:
+        m = rx.search(s)
+        if m is not None and (cut is None or m.start() < cut):
+            cut = m.start()
+    if cut is None:
+        return None
+    prefix = strip_release_info(s[:cut], aggressive=True)
+    prefix = trim_stranded_separators(prefix)
+    return prefix or None
+
+
 def series_query_string(path: Path) -> str:
     """Derive a TMDB TV search string from folder / filename."""
-    from titleforge.normalize import strip_release_info
+    from titleforge.normalize import strip_release_info, title_prefix
 
-    parent = strip_release_info(path.parent.name, aggressive=True)
-    # Remove S01 / Season 1 from folder name
-    parent = re.sub(r"(?i)\bS\d{1,4}\b", " ", parent)
-    parent = re.sub(r"(?i)\bSeason\s*\d{1,4}\b", " ", parent)
-    parent = re.sub(r"\s+", " ", parent).strip()
-    if parent:
-        return parent
+    # Parent folder: title prefix before the first junk boundary; fall back to
+    # the legacy subtractive cleaning when the name *starts* with junk.
+    parent_name = path.parent.name
+    if parent_name:
+        parent = title_prefix(parent_name)
+        if not parent:
+            parent = strip_release_info(parent_name, aggressive=True)
+            parent = re.sub(r"(?i)\bS\d{1,4}\b", " ", parent)
+            parent = re.sub(r"(?i)\bSeason\s*\d{1,4}\b", " ", parent)
+            parent = re.sub(r"\s+", " ", parent).strip()
+        if parent:
+            return parent
+    # Filename: the series name is the text BEFORE the episode marker — never
+    # the marker-stripped remainder, which would keep the episode title.
+    prefix = series_prefix_from_stem(path.stem)
+    if prefix:
+        return prefix
     stem = strip_release_info(path.stem, aggressive=True)
     stem = _S00E00.sub(" ", stem)
     stem = _NxNN.sub(" ", stem)

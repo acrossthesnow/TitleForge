@@ -78,6 +78,35 @@ def ensure_tmdb_credentials_interactive() -> None:
     load_dotenv(cfg_path, override=True)
 
 
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def get_convert_for_streaming_enabled() -> bool:
+    """Config default for streaming-compatibility conversion (``CONVERT_FOR_STREAMING=true``).
+
+    Umbrella key — currently this means the DV7→DV8.1 remux. The CLI flags
+    ``--convert-for-streaming`` / ``--no-convert-for-streaming`` win over this
+    value. Reads the environment populated by :func:`load_dotenv_sources`
+    (user-level titleforge.conf, then cwd override, then real env vars).
+    """
+    return os.environ.get("CONVERT_FOR_STREAMING", "").strip().lower() in _TRUTHY
+
+
+def get_remux_tools():
+    """Tool paths for the DV7 remux pipeline (``FFMPEG_PATH`` etc.).
+
+    Defaults to bare executable names resolved on PATH.
+    """
+    from titleforge.remux import RemuxTools
+
+    return RemuxTools(
+        ffmpeg=os.environ.get("FFMPEG_PATH", "").strip() or "ffmpeg",
+        ffprobe=os.environ.get("FFPROBE_PATH", "").strip() or "ffprobe",
+        dovi_tool=os.environ.get("DOVI_TOOL_PATH", "").strip() or "dovi_tool",
+        mkvmerge=os.environ.get("MKVMERGE_PATH", "").strip() or "mkvmerge",
+    )
+
+
 def get_tmdb_api_key() -> str:
     """TMDB v3 API key or v4 read access token (JWT)."""
     key = _tmdb_key_from_environ()

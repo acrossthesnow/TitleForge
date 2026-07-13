@@ -60,7 +60,8 @@ TitleForge is a two-phase TMDB-backed renamer that produces Plex-style `Movies/<
   2. If the file lives under a pre-bound input entity (`entity_packs`) → `resolve_pack_tv_member`.
   3. Else by `guess_kind` → `resolve_episode`, `resolve_movie`, or `resolve_ambiguous_dual` (movie + TV search merged).
 - `nfo.py` — Reads sibling `.nfo` files for IMDb / TMDB ids so movies with embedded ids skip the search step.
-- `review_app.py` — Textual UI. DataTable cells take Rich markup, so paths containing `{tmdb-…}` / brackets must be rendered as literal `Text` to avoid markup parsing.
+- `remux.py` — Lossless Dolby Vision profile 7 → 8.1 remux (`ffprobe` detect → `ffmpeg`-piped-into-`dovi_tool` convert → `mkvmerge` remux, with mandatory output verification before the original is consumed). Opt-in via `--convert-for-streaming` / `CONVERT_FOR_STREAMING=true` (umbrella flag; DV7→8.1 is currently its only conversion); tool paths via `FFMPEG_PATH` / `FFPROBE_PATH` / `DOVI_TOOL_PATH` / `MKVMERGE_PATH` in `config.py`. Deliberately TUI-free (pure logic + subprocess — the only subprocess use in the repo) so it stays unit-testable. Integration point: `review_app._maybe_remux_dv7`, called per entry before the move; a `RemuxError` never aborts the run (the original is moved unchanged).
+- `review_app.py` — Textual UI. DataTable cells take Rich markup, so paths containing `{tmdb-…}` / brackets must be rendered as literal `Text` to avoid markup parsing. When `remux_tools` is set, Phase 2 moves run in a thread worker (remuxes take minutes-to-hours) — with it unset, moves stay synchronous and behavior is unchanged.
 - `prompt_ui.py` — `questionary` styling + TTY-clear helpers for interactive disambiguation.
 
 ### Cross-cutting invariants
